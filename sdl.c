@@ -15,6 +15,7 @@
 
 // --- Color definitions for progress bar ---
 #define ANSI_COLOR_GREEN   "\x1b[32m"
+#define ANSI_COLOR_RED     "\x1b[31m" // Define ANSI color for red
 #define ANSI_COLOR_RESET   "\x1b[0m"
 
 // Global variable to hold the total number of downloads for progress bar rendering
@@ -30,6 +31,14 @@ struct progress_data {
     long long last_time_us; // Last time in microseconds
 };
 
+// Enum to represent the status of a download
+enum transfer_status {
+    STATUS_PENDING,
+    STATUS_DOWNLOADING,
+    STATUS_FAILED,
+    STATUS_SUCCESS
+};
+
 // Structure to hold all context for a single transfer
 struct transfer_context {
     CURL *easy_handle;          // The easy handle for this specific transfer
@@ -37,6 +46,8 @@ struct transfer_context {
     char *filename;             // The name of the output file
     struct progress_data progress; // The progress data for this transfer's progress bar
     int line_number;            // The terminal line number for this transfer's progress bar
+    enum transfer_status status; // The current status of the download
+    long response_code;         // To store the final HTTP response code
 };
 
 // Function to handle libcurl write operations (saving data to a file)
@@ -107,74 +118,92 @@ char* generate_copy_filename(const char* original_filename) {
 // Function to display the progress bar (updated for CURLOPT_XFERINFOFUNCTION)
 int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
     struct transfer_context *context = (struct transfer_context *)clientp;
-    struct progress_data *progress = &context->progress;
-    (void)ultotal; // ultotal is unused for download progress
-    (void)ulnow;   // ulnow is unused for download progress
+    (void)ultotal; (void)ulnow; // Unused for downloads
 
-    // Static variable to hold the calculated speed, so it persists across calls
-    static double displayed_speed_bps = 0.0;
+    // --- State Machine Logic ---
+    if (context->status == STATUS_PENDING) {
+        curl_easy_getinfo(context->easy_handle, CURLINFO_RESPONSE_CODE, &context->response_code);
+        if (context->response_code > 0) { // Headers received
+            if (context->response_code >= 200 && context->response_code < 300) {
+                context->status = STATUS_DOWNLOADING;
+            } else {
+                context->status = STATUS_FAILED;
+            }
+        }
+    }
 
-    // Get current time in microseconds
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    long long current_time_us = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
+    if (context->status == STATUS_PENDING) {
+        return 0; // Don't draw anything until headers are received
+    }
 
-    // --- Speed Calculation ---
-    double time_diff_sec = (double)(current_time_us - progress->last_time_us) / 1000000.0;
+    // --- ANSI Cursor Manipulation for multi-bar display ---
+    // Save cursor position and move to the correct line
+    printf("\r\x1b[%dA", g_total_downloads - context->line_number);
+
+    // Find the base filename for display
+    const char *display_filename = strrchr(context->filename, '/');
+    display_filename = display_filename ? display_filename + 1 : context->filename;
     
-    if (time_diff_sec > 0.5) {
-        curl_off_t data_diff = dlnow - progress->last_dl_now;
-        displayed_speed_bps = (double)data_diff / time_diff_sec; // bytes per second
-        progress->last_dl_now = dlnow;
-        progress->last_time_us = current_time_us;
-    } else if (progress->last_time_us == 0) {
-        progress->last_dl_now = dlnow;
-        progress->last_time_us = current_time_us;
+    int bar_width = 40;
+
+    switch (context->status) {
+                                            case STATUS_DOWNLOADING: {
+                                                if (dltotal > 0) {
+                                                    // Speed calculation
+                                                    struct progress_data *progress = &context->progress;
+                                                    static double speed_bps = 0.0;
+                                                    struct timeval tv;
+                                                    gettimeofday(&tv, NULL);
+                                                    long long current_time_us = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
+                                                    double time_diff_sec = (double)(current_time_us - progress->last_time_us) / 1000000.0;
+                                
+                                                    if (time_diff_sec > 0.5) {
+                                                        speed_bps = (double)(dlnow - progress->last_dl_now) / time_diff_sec;
+                                                        progress->last_dl_now = dlnow;
+                                                        progress->last_time_us = current_time_us;
+                                                    } else if (progress->last_time_us == 0) {
+                                                        progress->last_dl_now = dlnow;
+                                                        progress->last_time_us = current_time_us;
+                                                    }
+                                                    
+                                                    // Format speed for display
+                                                    char speed_str[32];
+                                                    if (speed_bps < 1024) snprintf(speed_str, sizeof(speed_str), "%.0f B/s", speed_bps);
+                                                    else if (speed_bps < 1024*1024) snprintf(speed_str, sizeof(speed_str), "%.1f KB/s", speed_bps/1024);
+                                                    else snprintf(speed_str, sizeof(speed_str), "%.1f MB/s", speed_bps/(1024*1024));
+                                
+                                                    // Draw the progress bar
+                                                    double percentage = ((double)dlnow / dltotal) * 100.0;
+                                                    int num_blocks = (int)(percentage / 100.0 * bar_width);
+                                                    
+                                                    char colored_bracket[32]; // Buffer for colored bracket
+                                                    snprintf(colored_bracket, sizeof(colored_bracket), "[%s", ANSI_COLOR_GREEN);
+                                                    printf("%-20.20s %s", display_filename, colored_bracket);
+                                                    
+                                                    for (int i = 0; i < num_blocks; i++) printf("\u2588");
+                                                    printf(ANSI_COLOR_RESET);
+                                                    for (int i = num_blocks; i < bar_width; i++) printf("\u2591");
+                                                    printf("] %6.2f%% %-12s", percentage, speed_str);
+                                                }
+                                                break;
+                                            }
+                                            case STATUS_FAILED: {
+                                                // Draw a "Failed" message
+                                                char colored_bracket[32]; // Buffer for colored bracket
+                                                snprintf(colored_bracket, sizeof(colored_bracket), "[%s", ANSI_COLOR_RED);
+                                                printf("%-20.20s %s", display_filename, colored_bracket);
+                                                
+                                                for (int i = 0; i < bar_width; i++) printf("!");
+                                                printf(ANSI_COLOR_RESET "] Failed (Code: %ld)       ", context->response_code);
+                                                break;
+                                            }        default:
+            // Should not happen during transfer
+            break;
     }
 
-
-    // --- Progress Bar Display ---
-    if (dltotal > 0) {
-        int progress_bar_width = 40; // Smaller width for multi-download
-        double progress_percentage = ((double)dlnow / dltotal) * 100.0;
-        int num_blocks = (int)(progress_percentage / 100.0 * progress_bar_width);
-
-        // Format speed for display
-        char speed_str[32];
-        if (displayed_speed_bps < 1024) {
-            snprintf(speed_str, sizeof(speed_str), "%.0f B/s", displayed_speed_bps);
-        } else if (displayed_speed_bps < 1024 * 1024) {
-            snprintf(speed_str, sizeof(speed_str), "%.1f KB/s", displayed_speed_bps / 1024.0);
-        } else {
-            snprintf(speed_str, sizeof(speed_str), "%.1f MB/s", displayed_speed_bps / (1024.0 * 1024.0));
-        }
-
-        // --- ANSI Cursor Manipulation for multi-bar display ---
-        // Move cursor up to the correct line, print, then move back down
-        printf("\r\x1b[%dA", g_total_downloads - context->line_number);
-        
-        // Find the base filename for display
-        const char *display_filename = strrchr(context->filename, '/');
-        if (display_filename) {
-            display_filename++; // Move past the slash
-        } else {
-            display_filename = context->filename;
-        }
-
-        // Print the filename and progress bar
-        printf("%-20.20s [", display_filename);
-        for (int i = 0; i < num_blocks; i++) {
-            printf(ANSI_COLOR_GREEN "\u2588" ANSI_COLOR_RESET);
-        }
-        for (int i = num_blocks; i < progress_bar_width; i++) {
-            printf("\u2591");
-        }
-        printf("] %.2f%% %-12s", progress_percentage, speed_str);
-
-        // Move cursor back down to the line below the progress bars
-        printf("\x1b[%dB", g_total_downloads - context->line_number);
-        fflush(stdout); // Flush the output buffer to display immediately
-    }
+    // Move cursor back down to the line below the progress bars
+    printf("\x1b[%dB", g_total_downloads - context->line_number);
+    fflush(stdout); // Flush the output buffer to display immediately
 
     return 0; // Return 0 to continue the transfer
 }
@@ -290,6 +319,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < num_urls; i++) {
         // Initialize context fields to NULL/0
         memset(&contexts[i], 0, sizeof(struct transfer_context));
+        contexts[i].status = STATUS_PENDING;
 
         contexts[i].easy_handle = curl_easy_init();
         if (!contexts[i].easy_handle) {
@@ -387,8 +417,6 @@ int main(int argc, char *argv[]) {
 
     // --- Perform the transfers ---
     int still_running = 0;
-    char* error_messages[100] = {NULL};
-    int error_count = 0;
     curl_multi_perform(multi_handle, &still_running);
 
     do {
@@ -409,30 +437,21 @@ int main(int argc, char *argv[]) {
                 CURL *easy_handle = msg->easy_handle;
                 CURLcode result = msg->data.result;
                 
-                // Get HTTP response code
-                long response_code = 0;
-                curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
-
                 // Find which transfer this message belongs to
                 for (int i = 0; i < num_urls; i++) {
                     if (contexts[i].easy_handle == easy_handle) {
+                        long response_code = 0;
+                        curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
+                        contexts[i].response_code = response_code;
+
                         if (result == CURLE_OK && (response_code >= 200 && response_code < 300)) {
-                            // Download was successful
+                            contexts[i].status = STATUS_SUCCESS;
                         } else {
-                            // Download failed, cleanup the file and store error
+                            contexts[i].status = STATUS_FAILED;
                             if (contexts[i].fp) {
                                 fclose(contexts[i].fp);
                                 contexts[i].fp = NULL; // Avoid double close
                                 remove(contexts[i].filename);
-                            }
-                            if (error_count < 100) {
-                                char buffer[256];
-                                if (result != CURLE_OK) {
-                                    snprintf(buffer, sizeof(buffer), "URL %s failed: %s", urls[i], curl_easy_strerror(result));
-                                } else {
-                                    snprintf(buffer, sizeof(buffer), "URL %s failed: Server responded with code %ld", urls[i], response_code);
-                                }
-                                error_messages[error_count++] = strdup(buffer);
                             }
                         }
                         break;
@@ -442,15 +461,44 @@ int main(int argc, char *argv[]) {
         }
     } while (still_running);
     
-    // --- Print any errors that occurred ---
-    if (error_count > 0) {
-        fprintf(stderr, "\n--- Errors ---\n");
-        for (int i = 0; i < error_count; i++) {
-            fprintf(stderr, "%s\n", error_messages[i]);
-            free(error_messages[i]); // Free the duplicated error string
-        }
-    }
+    // --- Final Rendering Pass ---
+    // Iterate through all contexts and print their final status on their lines
+    for (int i = 0; i < num_urls; i++) {
+        if (contexts[i].easy_handle == NULL) continue; // Skip if this handle was never added or was skipped
 
+        // Move cursor up to the correct line
+        printf("\r\x1b[%dA", g_total_downloads - contexts[i].line_number);
+
+        // Find the base filename for display
+        const char *display_filename = strrchr(contexts[i].filename, '/');
+        display_filename = display_filename ? display_filename + 1 : contexts[i].filename;
+
+        int bar_width = 40; // Same as in progress_callback
+
+        switch (contexts[i].status) {
+            case STATUS_SUCCESS:
+                printf("%-20.20s ", display_filename); // Print filename and space
+                printf("[%s", ANSI_COLOR_GREEN);       // Print colored opening bracket
+                for (int k = 0; k < bar_width; k++) printf("\u2588");
+                printf(ANSI_COLOR_RESET "] [Completed]               "); // Clear the rest of the line
+                break;
+            case STATUS_FAILED:
+                printf("%-20.20s ", display_filename); // Print filename and space
+                printf("[%s", ANSI_COLOR_RED);           // Print colored opening bracket
+                for (int k = 0; k < bar_width; k++) printf("!");
+                printf(ANSI_COLOR_RESET "] [Failed (Code: %ld)]", contexts[i].response_code);
+                break;
+            case STATUS_PENDING: // Should not happen for active transfers, but for robustness
+            case STATUS_DOWNLOADING: // Should now be finished, if not SUCCESS or FAILED
+            default:
+                printf("%-20.20s [----------------------------------------] [Skipped/Error]       ", display_filename);
+                break;
+        }
+        // Move cursor back down
+        printf("\x1b[%dB", g_total_downloads - contexts[i].line_number);
+    }
+    printf("\n"); // Final newline to push the prompt below the output
+    
     // --- Cleanup ---
     for (int i = 0; i < num_urls; i++) {
         if (contexts[i].easy_handle) {
@@ -462,6 +510,11 @@ int main(int argc, char *argv[]) {
     }
     curl_multi_cleanup(multi_handle);
     curl_global_cleanup();
+
+    // Print final newlines to clear the progress bars and push the prompt down
+    for (int i = 0; i < g_total_downloads; i++) {
+        printf("\n");
+    }
 
     return EXIT_SUCCESS; // Exit successfully
 }
