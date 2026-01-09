@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.2.2"
+#define SDL_VERSION "0.2.3"
 
 // sdl.c - Simple Downloader v0.1
 // A command-line utility to download files from a given URL with a progress bar.
@@ -387,6 +387,8 @@ int main(int argc, char *argv[]) {
 
     // --- Perform the transfers ---
     int still_running = 0;
+    char* error_messages[100] = {NULL};
+    int error_count = 0;
     curl_multi_perform(multi_handle, &still_running);
 
     do {
@@ -404,11 +406,35 @@ int main(int argc, char *argv[]) {
         int msgs_left;
         while ((msg = curl_multi_info_read(multi_handle, &msgs_left))) {
             if (msg->msg == CURLMSG_DONE) {
+                CURL *easy_handle = msg->easy_handle;
+                CURLcode result = msg->data.result;
+                
+                // Get HTTP response code
+                long response_code = 0;
+                curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
+
                 // Find which transfer this message belongs to
                 for (int i = 0; i < num_urls; i++) {
-                    if (contexts[i].easy_handle == msg->easy_handle) {
-                        // Optional: Print final status for this transfer
-                        // The progress bar already shows 100%, so this might be redundant
+                    if (contexts[i].easy_handle == easy_handle) {
+                        if (result == CURLE_OK && (response_code >= 200 && response_code < 300)) {
+                            // Download was successful
+                        } else {
+                            // Download failed, cleanup the file and store error
+                            if (contexts[i].fp) {
+                                fclose(contexts[i].fp);
+                                contexts[i].fp = NULL; // Avoid double close
+                                remove(contexts[i].filename);
+                            }
+                            if (error_count < 100) {
+                                char buffer[256];
+                                if (result != CURLE_OK) {
+                                    snprintf(buffer, sizeof(buffer), "URL %s failed: %s", urls[i], curl_easy_strerror(result));
+                                } else {
+                                    snprintf(buffer, sizeof(buffer), "URL %s failed: Server responded with code %ld", urls[i], response_code);
+                                }
+                                error_messages[error_count++] = strdup(buffer);
+                            }
+                        }
                         break;
                     }
                 }
@@ -416,6 +442,14 @@ int main(int argc, char *argv[]) {
         }
     } while (still_running);
     
+    // --- Print any errors that occurred ---
+    if (error_count > 0) {
+        fprintf(stderr, "\n--- Errors ---\n");
+        for (int i = 0; i < error_count; i++) {
+            fprintf(stderr, "%s\n", error_messages[i]);
+            free(error_messages[i]); // Free the duplicated error string
+        }
+    }
 
     // --- Cleanup ---
     for (int i = 0; i < num_urls; i++) {
