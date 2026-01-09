@@ -1,3 +1,4 @@
+
 // sdl.c - Simple Downloader v0.1
 // A command-line utility to download files from a given URL with a progress bar.
 
@@ -5,10 +6,76 @@
 #include <stdlib.h>
 #include <string.h>
 #include <curl/curl.h> // Required for libcurl - a library for transferring data with URLs
+#include <sys/time.h> // Required for gettimeofday to calculate download speed
+
+// --- Color definitions for progress bar ---
+#define ANSI_COLOR_GREEN   "\x1b[32m"
+#define ANSI_COLOR_RESET   "\x1b[0m"
+
+// Structure to hold progress bar data, including data for speed calculation
+struct progress_data {
+    curl_off_t last_dl_now;    // Last reported downloaded bytes
+    long long last_time_us; // Last time in microseconds
+};
 
 // Function to handle libcurl write operations (saving data to a file)
 size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     return fwrite(ptr, size, nmemb, stream);
+}
+
+// Function to display the progress bar (updated for CURLOPT_XFERINFOFUNCTION)
+int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
+    struct progress_data *progress = (struct progress_data *)clientp;
+    (void)ultotal; // ultotal is unused for download progress
+    (void)ulnow;   // ulnow is unused for download progress
+
+    // Get current time in microseconds
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    long long current_time_us = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
+
+    // Calculate download speed
+    double speed_bps = 0.0;
+    if (progress->last_time_us != 0 && current_time_us > progress->last_time_us) {
+        double time_diff_sec = (double)(current_time_us - progress->last_time_us) / 1000000.0;
+        curl_off_t data_diff = dlnow - progress->last_dl_now;
+        if (time_diff_sec > 0) {
+            speed_bps = (double)data_diff / time_diff_sec; // bytes per second
+        }
+    }
+
+    // Update last reported values for the next iteration
+    progress->last_dl_now = dlnow;
+    progress->last_time_us = current_time_us;
+
+    // Only update the progress bar if there's actual download data
+    if (dltotal > 0) {
+        int progress_bar_width = 50; // Width of the progress bar
+        double progress_percentage = ((double)dlnow / dltotal) * 100.0;
+        int num_blocks = (int)(progress_percentage / 100.0 * progress_bar_width);
+
+        // Format speed for display
+        char speed_str[32];
+        if (speed_bps < 1024) {
+            snprintf(speed_str, sizeof(speed_str), "%.0f B/s", speed_bps);
+        } else if (speed_bps < 1024 * 1024) {
+            snprintf(speed_str, sizeof(speed_str), "%.1f KB/s", speed_bps / 1024.0);
+        } else {
+            snprintf(speed_str, sizeof(speed_str), "%.1f MB/s", speed_bps / (1024.0 * 1024.0));
+        }
+        
+        printf("\r["); // \r returns the cursor to the beginning of the line
+        for (int i = 0; i < num_blocks; i++) {
+            printf(ANSI_COLOR_GREEN "\u2588" ANSI_COLOR_RESET); // Filled block (Unicode full block)
+        }
+        for (int i = num_blocks; i < progress_bar_width; i++) {
+            printf("\u2591"); // Empty block (Unicode light shade block)
+        }
+        printf("] %.2f%% %s", progress_percentage, speed_str);
+        fflush(stdout); // Flush the output buffer to display immediately
+    }
+
+    return 0; // Return 0 to continue the transfer
 }
 
 // main function - entry point of the program
@@ -64,6 +131,15 @@ int main(int argc, char *argv[]) {
         // Set the write function to save data to a file
         curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_data);
 
+        // Enable progress meter
+        curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0L);
+        // Set progress callback function using the new XFERINFOFUNCTION
+        struct progress_data progress = {0, 0}; // Initialize all members to zero
+        curl_easy_setopt(curl_handle, CURLOPT_XFERINFOFUNCTION, progress_callback);
+        // Pass progress data to the callback function (CURLOPT_XFERINFODATA for the new function)
+        curl_easy_setopt(curl_handle, CURLOPT_XFERINFODATA, &progress);
+
+
         // Determine output filename
         // This is a simplistic approach; a more robust solution would parse the URL
         // to extract the filename or use Content-Disposition header.
@@ -91,9 +167,9 @@ int main(int argc, char *argv[]) {
 
         // Check for errors
         if (res != CURLE_OK) {
-            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+            fprintf(stderr, "\ncurl_easy_perform() failed: %s\n", curl_easy_strerror(res));
         } else {
-            printf("Download complete! File saved as: %s\n", output_filename);
+            printf("\nDownload complete! File saved as: %s\n", output_filename);
         }
 
         // Close the file
@@ -112,6 +188,9 @@ To compile this program, you need to have libcurl installed.
 On Debian/Ubuntu, you can install it using:
     sudo apt-get update
     sudo apt-get install libcurl4-openssl-dev
+
+On openSUSE, you can install it using:
+    sudo zypper install libcurl-devel
 
 Then compile with:
     gcc sdl.c -o sdl $(pkg-config --libs --cflags libcurl)
