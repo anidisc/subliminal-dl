@@ -29,25 +29,33 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_
     (void)ultotal; // ultotal is unused for download progress
     (void)ulnow;   // ulnow is unused for download progress
 
+    // Static variable to hold the calculated speed, so it persists across calls
+    static double displayed_speed_bps = 0.0;
+
     // Get current time in microseconds
     struct timeval tv;
     gettimeofday(&tv, NULL);
     long long current_time_us = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
 
-    // Calculate download speed
-    double speed_bps = 0.0;
-    if (progress->last_time_us != 0 && current_time_us > progress->last_time_us) {
-        double time_diff_sec = (double)(current_time_us - progress->last_time_us) / 1000000.0;
+    // --- Speed Calculation ---
+    // We only update the speed calculation every half a second to get a stable reading.
+    double time_diff_sec = (double)(current_time_us - progress->last_time_us) / 1000000.0;
+    
+    if (time_diff_sec > 0.5) {
         curl_off_t data_diff = dlnow - progress->last_dl_now;
-        if (time_diff_sec > 0) {
-            speed_bps = (double)data_diff / time_diff_sec; // bytes per second
-        }
+        displayed_speed_bps = (double)data_diff / time_diff_sec; // bytes per second
+
+        // Update markers for the next speed calculation
+        progress->last_dl_now = dlnow;
+        progress->last_time_us = current_time_us;
+    } else if (progress->last_time_us == 0) {
+        // Handle the very first call, initialize the time and data markers
+        progress->last_dl_now = dlnow;
+        progress->last_time_us = current_time_us;
     }
 
-    // Update last reported values for the next iteration
-    progress->last_dl_now = dlnow;
-    progress->last_time_us = current_time_us;
 
+    // --- Progress Bar Display ---
     // Only update the progress bar if there's actual download data
     if (dltotal > 0) {
         int progress_bar_width = 50; // Width of the progress bar
@@ -56,12 +64,12 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_
 
         // Format speed for display
         char speed_str[32];
-        if (speed_bps < 1024) {
-            snprintf(speed_str, sizeof(speed_str), "%.0f B/s", speed_bps);
-        } else if (speed_bps < 1024 * 1024) {
-            snprintf(speed_str, sizeof(speed_str), "%.1f KB/s", speed_bps / 1024.0);
+        if (displayed_speed_bps < 1024) {
+            snprintf(speed_str, sizeof(speed_str), "%.0f B/s", displayed_speed_bps);
+        } else if (displayed_speed_bps < 1024 * 1024) {
+            snprintf(speed_str, sizeof(speed_str), "%.1f KB/s", displayed_speed_bps / 1024.0);
         } else {
-            snprintf(speed_str, sizeof(speed_str), "%.1f MB/s", speed_bps / (1024.0 * 1024.0));
+            snprintf(speed_str, sizeof(speed_str), "%.1f MB/s", displayed_speed_bps / (1024.0 * 1024.0));
         }
         
         printf("\r["); // \r returns the cursor to the beginning of the line
@@ -71,7 +79,8 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_
         for (int i = num_blocks; i < progress_bar_width; i++) {
             printf("\u2591"); // Empty block (Unicode light shade block)
         }
-        printf("] %.2f%% %s", progress_percentage, speed_str);
+        // Add spaces at the end to clear previous, longer speed strings
+        printf("] %.2f%% %-12s", progress_percentage, speed_str);
         fflush(stdout); // Flush the output buffer to display immediately
     }
 
