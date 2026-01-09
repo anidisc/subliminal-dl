@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.2.1"
+#define SDL_VERSION "0.2.2"
 
 // sdl.c - Simple Downloader v0.1
 // A command-line utility to download files from a given URL with a progress bar.
@@ -10,6 +10,8 @@
 #include <curl/curl.h> // Required for libcurl - a library for transferring data with URLs
 #include <sys/time.h> // Required for gettimeofday to calculate download speed
 #include <unistd.h>   // Required for access() to check file existence
+#include <sys/stat.h> // Required for stat() and mkdir()
+#include <errno.h>    // Required for errno and EEXIST
 
 // --- Color definitions for progress bar ---
 #define ANSI_COLOR_GREEN   "\x1b[32m"
@@ -19,6 +21,8 @@
 static int g_total_downloads = 0;
 // Global flag to always overwrite files if they exist
 static int g_always_overwrite = 0;
+// Global variable for the destination directory
+static char* g_destination_dir = NULL;
 
 // Structure to hold progress bar data, including data for speed calculation
 struct progress_data {
@@ -38,6 +42,34 @@ struct transfer_context {
 // Function to handle libcurl write operations (saving data to a file)
 size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     return fwrite(ptr, size, nmemb, stream);
+}
+
+// Helper function to create a directory path recursively
+int mkdir_recursive(const char *path, mode_t mode) {
+    char *p;
+    char *path_copy = strdup(path);
+
+    for (p = path_copy + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(path_copy, mode) != 0) {
+                if (errno != EEXIST) {
+                    free(path_copy);
+                    return -1;
+                }
+            }
+            *p = '/';
+        }
+    }
+    if (mkdir(path_copy, mode) != 0) {
+        if (errno != EEXIST) {
+            free(path_copy);
+            return -1;
+        }
+    }
+
+    free(path_copy);
+    return 0;
 }
 
 // Helper function to generate a new filename for a copy
@@ -121,8 +153,16 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_
         // Move cursor up to the correct line, print, then move back down
         printf("\r\x1b[%dA", g_total_downloads - context->line_number);
         
+        // Find the base filename for display
+        const char *display_filename = strrchr(context->filename, '/');
+        if (display_filename) {
+            display_filename++; // Move past the slash
+        } else {
+            display_filename = context->filename;
+        }
+
         // Print the filename and progress bar
-        printf("%-20.20s [", context->filename);
+        printf("%-20.20s [", display_filename);
         for (int i = 0; i < num_blocks; i++) {
             printf(ANSI_COLOR_GREEN "\u2588" ANSI_COLOR_RESET);
         }
@@ -150,8 +190,11 @@ int main(int argc, char *argv[]) {
 
     // Check if enough arguments are provided
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s [--always-overwrite | -aw] [--url <URL> | --multi <URL1> ...]\n", argv[0]);
-        fprintf(stderr, "       %s --version\n", argv[0]);
+        fprintf(stderr, "Usage: %s [options] [--url <URL> | --multi <URL1> ...]\n", argv[0]);
+        fprintf(stderr, "Options:\n");
+        fprintf(stderr, "  -d, --destination <dir>    Set destination directory\n");
+        fprintf(stderr, "  -aw, --always-overwrite    Always overwrite existing files\n");
+        fprintf(stderr, "  -v, --version              Show version\n");
         return EXIT_FAILURE; // Exit with an error code
     }
 
@@ -162,6 +205,13 @@ int main(int argc, char *argv[]) {
             return EXIT_SUCCESS;
         } else if (strcmp(argv[i], "--always-overwrite") == 0 || strcmp(argv[i], "-aw") == 0) {
             g_always_overwrite = 1;
+        } else if (strcmp(argv[i], "--destination") == 0 || strcmp(argv[i], "-d") == 0) {
+            if (++i < argc) {
+                g_destination_dir = argv[i];
+            } else {
+                fprintf(stderr, "Error: No directory provided after %s\n", argv[i-1]);
+                return EXIT_FAILURE;
+            }
         } else if (strcmp(argv[i], "--url") == 0 || strcmp(argv[i], "-u") == 0) {
             if (++i < argc) {
                 url = argv[i];
@@ -198,7 +248,30 @@ int main(int argc, char *argv[]) {
         urls[0] = url;
     }
 
-    g_total_downloads = num_urls; // Set global for progress callback
+    // --- Handle destination directory ---
+    if (g_destination_dir) {
+        struct stat st = {0};
+        if (stat(g_destination_dir, &st) == -1) {
+            // Directory does not exist, ask to create it
+            printf("Destination directory '%s' does not exist. Create it? [Y/n] ", g_destination_dir);
+            int choice = getchar();
+            while (getchar() != '\n' && choice != '\n'); // Clear stdin
+
+            if (choice == 'y' || choice == 'Y' || choice == '\n') {
+                if (mkdir_recursive(g_destination_dir, 0755) == -1) {
+                    fprintf(stderr, "Error: Could not create directory '%s'.\n", g_destination_dir);
+                    return EXIT_FAILURE;
+                }
+                printf("Directory '%s' created.\n", g_destination_dir);
+            } else {
+                fprintf(stderr, "Aborted. Destination directory does not exist.\n");
+                return EXIT_FAILURE;
+            }
+        } else if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Error: Destination path '%s' exists but is not a directory.\n", g_destination_dir);
+            return EXIT_FAILURE;
+        }
+    }
 
     // --- Multi-download logic setup ---
     CURLM *multi_handle = NULL;
@@ -224,12 +297,21 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Determine output filename from URL
-        char* original_filename_ptr = strrchr(urls[i], '/');
-        if (original_filename_ptr) {
-            contexts[i].filename = strdup(original_filename_ptr + 1);
+        // Determine base filename from URL
+        char* base_filename_ptr = strrchr(urls[i], '/');
+        if (!base_filename_ptr) {
+            base_filename_ptr = "downloaded_file";
         } else {
-            contexts[i].filename = strdup("downloaded_file"); 
+            base_filename_ptr++; // Move past the slash
+        }
+
+        // Construct full path if destination dir is set
+        if (g_destination_dir) {
+            size_t path_len = strlen(g_destination_dir) + strlen(base_filename_ptr) + 2; // +2 for '/' and '\0'
+            contexts[i].filename = malloc(path_len);
+            snprintf(contexts[i].filename, path_len, "%s/%s", g_destination_dir, base_filename_ptr);
+        } else {
+            contexts[i].filename = strdup(base_filename_ptr);
         }
 
         // --- File conflict check ---
