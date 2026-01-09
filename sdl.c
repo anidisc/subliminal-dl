@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.2.0"
+#define SDL_VERSION "0.2.1"
 
 // sdl.c - Simple Downloader v0.1
 // A command-line utility to download files from a given URL with a progress bar.
@@ -9,6 +9,7 @@
 #include <string.h>
 #include <curl/curl.h> // Required for libcurl - a library for transferring data with URLs
 #include <sys/time.h> // Required for gettimeofday to calculate download speed
+#include <unistd.h>   // Required for access() to check file existence
 
 // --- Color definitions for progress bar ---
 #define ANSI_COLOR_GREEN   "\x1b[32m"
@@ -16,6 +17,8 @@
 
 // Global variable to hold the total number of downloads for progress bar rendering
 static int g_total_downloads = 0;
+// Global flag to always overwrite files if they exist
+static int g_always_overwrite = 0;
 
 // Structure to hold progress bar data, including data for speed calculation
 struct progress_data {
@@ -35,6 +38,38 @@ struct transfer_context {
 // Function to handle libcurl write operations (saving data to a file)
 size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     return fwrite(ptr, size, nmemb, stream);
+}
+
+// Helper function to generate a new filename for a copy
+char* generate_copy_filename(const char* original_filename) {
+    char* new_filename = NULL;
+    char* basename = strdup(original_filename);
+    char* dot = strrchr(basename, '.');
+    if (dot) {
+        *dot = '\0'; // Temporarily terminate basename at the dot
+    }
+    const char* extension = dot ? dot + 1 : "";
+
+    int i = 1;
+    while (1) {
+        // Allocate space for "basename(i).extension\0"
+        new_filename = malloc(strlen(basename) + 10 + strlen(extension) + 1);
+        if (dot) {
+            sprintf(new_filename, "%s(%d).%s", basename, i, extension);
+        } else {
+            sprintf(new_filename, "%s(%d)", basename, i);
+        }
+
+        if (access(new_filename, F_OK) != 0) {
+            // File does not exist, we found a unique name
+            break;
+        }
+        free(new_filename);
+        i++;
+    }
+    
+    free(basename);
+    return new_filename;
 }
 
 // Function to display the progress bar (updated for CURLOPT_XFERINFOFUNCTION)
@@ -115,7 +150,7 @@ int main(int argc, char *argv[]) {
 
     // Check if enough arguments are provided
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s --url <URL> | --multi <URL1> <URL2> ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--always-overwrite | -aw] [--url <URL> | --multi <URL1> ...]\n", argv[0]);
         fprintf(stderr, "       %s --version\n", argv[0]);
         return EXIT_FAILURE; // Exit with an error code
     }
@@ -125,6 +160,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
             printf("sdl version %s\n", SDL_VERSION);
             return EXIT_SUCCESS;
+        } else if (strcmp(argv[i], "--always-overwrite") == 0 || strcmp(argv[i], "-aw") == 0) {
+            g_always_overwrite = 1;
         } else if (strcmp(argv[i], "--url") == 0 || strcmp(argv[i], "-u") == 0) {
             if (++i < argc) {
                 url = argv[i];
@@ -136,14 +173,17 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--multi") == 0 || strcmp(argv[i], "-m") == 0) {
             multi_mode = 1;
             // Collect all subsequent arguments as URLs
-            while (++i < argc && num_urls < 100) {
-                urls[num_urls++] = argv[i];
+            while (++i < argc && argv[i][0] != '-') {
+                if (num_urls < 100) {
+                    urls[num_urls++] = argv[i];
+                }
             }
+            i--; // Decrement because the loop will increment it
+            
             if (num_urls == 0) {
                 fprintf(stderr, "Error: No URLs provided after %s\n", argv[i-1]);
                 return EXIT_FAILURE;
             }
-            break; // Stop parsing after collecting multi URLs
         }
     }
 
@@ -173,35 +213,64 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
     
-    // Print empty lines to make space for progress bars
-    for (int i = 0; i < num_urls; i++) {
-        printf("\n");
-    }
-
     // Prepare each transfer
     for (int i = 0; i < num_urls; i++) {
-        contexts[i].line_number = i; // Assign line number for this download
+        // Initialize context fields to NULL/0
+        memset(&contexts[i], 0, sizeof(struct transfer_context));
+
         contexts[i].easy_handle = curl_easy_init();
         if (!contexts[i].easy_handle) {
             fprintf(stderr, "Error: curl_easy_init() failed for URL %s\n", urls[i]);
-            // Cleanup already added handles
             continue;
         }
 
-        // Determine output filename
-        contexts[i].filename = strrchr(urls[i], '/');
-        if (contexts[i].filename) {
-            contexts[i].filename++; // Move past the last slash
+        // Determine output filename from URL
+        char* original_filename_ptr = strrchr(urls[i], '/');
+        if (original_filename_ptr) {
+            contexts[i].filename = strdup(original_filename_ptr + 1);
         } else {
-            // strdup is needed to make a writable copy
             contexts[i].filename = strdup("downloaded_file"); 
+        }
+
+        // --- File conflict check ---
+        if (!g_always_overwrite && access(contexts[i].filename, F_OK) == 0) {
+            printf("File '%s' already exists. [O]verwrite, [C]opy, [S]kip? ", contexts[i].filename);
+            int choice = getchar();
+            while (getchar() != '\n' && choice != '\n'); // Clear stdin buffer
+
+            switch (choice) {
+                case 'c':
+                case 'C': {
+                    char* new_name = generate_copy_filename(contexts[i].filename);
+                    free(contexts[i].filename); // Free the old name
+                    contexts[i].filename = new_name;
+                    printf("Will save as '%s'\n", contexts[i].filename);
+                    break;
+                }
+                case 's':
+                case 'S':
+                    printf("Skipping download for '%s'\n", urls[i]);
+                    free(contexts[i].filename);
+                    contexts[i].filename = NULL;
+                    curl_easy_cleanup(contexts[i].easy_handle);
+                    contexts[i].easy_handle = NULL; // Mark as skipped
+                    continue; // Go to next URL in the loop
+                case 'o':
+                case 'O':
+                default:
+                    printf("Overwriting '%s'\n", contexts[i].filename);
+                    break; // Default is to overwrite
+            }
         }
 
         // Open file for writing
         contexts[i].fp = fopen(contexts[i].filename, "wb");
         if (!contexts[i].fp) {
             fprintf(stderr, "Error: Could not open file %s for writing.\n", contexts[i].filename);
+            free(contexts[i].filename);
+            contexts[i].filename = NULL;
             curl_easy_cleanup(contexts[i].easy_handle);
+            contexts[i].easy_handle = NULL; // Mark as failed/skipped
             continue;
         }
         
@@ -214,13 +283,26 @@ int main(int argc, char *argv[]) {
         curl_easy_setopt(contexts[i].easy_handle, CURLOPT_XFERINFOFUNCTION, progress_callback);
         
         // Pass the context for this transfer to the progress callback
-        memset(&contexts[i].progress, 0, sizeof(struct progress_data));
         curl_easy_setopt(contexts[i].easy_handle, CURLOPT_XFERINFODATA, &contexts[i]);
         
         // Add the easy handle to the multi handle
         curl_multi_add_handle(multi_handle, contexts[i].easy_handle);
     }
     
+    // --- Recalculate totals and assign line numbers for active downloads ---
+    int active_downloads = 0;
+    for (int i = 0; i < num_urls; i++) {
+        if (contexts[i].easy_handle) {
+            contexts[i].line_number = active_downloads++;
+        }
+    }
+    g_total_downloads = active_downloads;
+
+    // Print empty lines to make space for progress bars
+    for (int i = 0; i < g_total_downloads; i++) {
+        printf("\n");
+    }
+
     // --- Perform the transfers ---
     int still_running = 0;
     curl_multi_perform(multi_handle, &still_running);
@@ -260,10 +342,7 @@ int main(int argc, char *argv[]) {
             curl_easy_cleanup(contexts[i].easy_handle);
         }
         if (contexts[i].fp) fclose(contexts[i].fp);
-        // Free filename if it was duplicated for the default case
-        if (strstr(urls[i], "/") == NULL) {
-            free(contexts[i].filename);
-        }
+        if (contexts[i].filename) free(contexts[i].filename); // Always free filename
     }
     curl_multi_cleanup(multi_handle);
     curl_global_cleanup();
