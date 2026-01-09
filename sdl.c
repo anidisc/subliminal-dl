@@ -1,4 +1,6 @@
 
+#define SDL_VERSION "0.1.1"
+
 // sdl.c - Simple Downloader v0.1
 // A command-line utility to download files from a given URL with a progress bar.
 
@@ -95,13 +97,19 @@ int main(int argc, char *argv[]) {
     char *output_filename = NULL;
 
     // Check if enough arguments are provided
-    if (argc < 3) {
+    if (argc < 2) { // Changed from argc < 3 to allow --version/-v without a URL
         fprintf(stderr, "Usage: %s --url <URL> or -u <URL>\n", argv[0]);
+        fprintf(stderr, "       %s --version or -v\n", argv[0]);
         return EXIT_FAILURE; // Exit with an error code
     }
 
-    // Loop through command-line arguments to find the URL
+    // Loop through command-line arguments to find the URL or version flag
     for (int i = 1; i < argc; i++) {
+        // Check for --version or -v argument
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("sdl version %s\n", SDL_VERSION);
+            return EXIT_SUCCESS; // Exit successfully after showing version
+        }
         // Check for --url argument
         if (strcmp(argv[i], "--url") == 0 || strcmp(argv[i], "-u") == 0) {
             // Ensure there is a URL provided after --url or -u
