@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.3.0"
+#define SDL_VERSION "0.4.0"
 
 // sdl.c - Simple Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -27,6 +27,8 @@ static int g_total_downloads = 0;
 static int g_always_overwrite = 0;
 // Global variable for the destination directory
 static char *g_destination_dir = NULL;
+// Global variable for maximum parallel downloads (default 1000 for "parallel")
+static int g_max_parallel = 1000;
 
 // Structure to hold progress bar data, including data for speed calculation
 struct progress_data {
@@ -248,6 +250,8 @@ int main(int argc, char *argv[]) {
             "<file>]\n",
             argv[0]);
     fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -j, --jobs <mode>          Set download mode: 'code' "
+                    "(sequential) or 'parallel' (simultaneous)\n");
     fprintf(stderr, "  -f, --file <file>          Read URLs from a file\n");
     fprintf(stderr, "  -d, --destination <dir>    Set destination directory\n");
     fprintf(stderr,
@@ -270,6 +274,23 @@ int main(int argc, char *argv[]) {
         g_destination_dir = argv[i];
       } else {
         fprintf(stderr, "Error: No directory provided after %s\n", argv[i - 1]);
+        return EXIT_FAILURE;
+      }
+    } else if (strcmp(argv[i], "--jobs") == 0 || strcmp(argv[i], "-j") == 0) {
+      if (++i < argc) {
+        if (strcmp(argv[i], "code") == 0 || strcmp(argv[i], "queue") == 0 ||
+            strcmp(argv[i], "sequential") == 0) {
+          g_max_parallel = 1;
+        } else if (strcmp(argv[i], "parallel") == 0) {
+          g_max_parallel = 1000;
+        } else {
+          fprintf(stderr,
+                  "Error: Invalid argument for %s. Use 'code' or 'parallel'.\n",
+                  argv[i - 1]);
+          return EXIT_FAILURE;
+        }
+      } else {
+        fprintf(stderr, "Error: No mode provided after %s\n", argv[i - 1]);
         return EXIT_FAILURE;
       }
     } else if (strcmp(argv[i], "--url") == 0 || strcmp(argv[i], "-u") == 0) {
@@ -479,8 +500,8 @@ int main(int argc, char *argv[]) {
     curl_easy_setopt(contexts[i].easy_handle, CURLOPT_XFERINFODATA,
                      &contexts[i]);
 
-    // Add the easy handle to the multi handle
-    curl_multi_add_handle(multi_handle, contexts[i].easy_handle);
+    // Don't add to multi_handle here yet. We do it in the loop based on
+    // g_max_parallel
   }
 
   // --- Recalculate totals and assign line numbers for active downloads ---
@@ -498,6 +519,20 @@ int main(int argc, char *argv[]) {
   }
 
   // --- Perform the transfers ---
+  int transfers_running = 0;
+  int transfers_index = 0;
+
+  // Initial fill of the queue
+  while (transfers_index < num_urls && transfers_running < g_max_parallel) {
+    if (contexts[transfers_index]
+            .easy_handle) { // Only add if not skipped/failed during setup
+      curl_multi_add_handle(multi_handle,
+                            contexts[transfers_index].easy_handle);
+      transfers_running++;
+    }
+    transfers_index++;
+  }
+
   int still_running = 0;
   curl_multi_perform(multi_handle, &still_running);
 
@@ -511,13 +546,17 @@ int main(int argc, char *argv[]) {
 
     curl_multi_perform(multi_handle, &still_running);
 
-    // Check for finished transfers
+    // Check for finished transfers to refill the queue
     CURLMsg *msg;
     int msgs_left;
     while ((msg = curl_multi_info_read(multi_handle, &msgs_left))) {
       if (msg->msg == CURLMSG_DONE) {
         CURL *easy_handle = msg->easy_handle;
         CURLcode result = msg->data.result;
+
+        // Remove the finished handle
+        curl_multi_remove_handle(multi_handle, easy_handle);
+        transfers_running--;
 
         // Find which transfer this message belongs to
         for (int i = 0; i < num_urls; i++) {
@@ -541,9 +580,25 @@ int main(int argc, char *argv[]) {
             break;
           }
         }
+
+        // Add next transfer if available
+        while (transfers_index < num_urls &&
+               transfers_running < g_max_parallel) {
+          if (contexts[transfers_index]
+                  .easy_handle) { // Only add if not skipped/failed during setup
+            curl_multi_add_handle(multi_handle,
+                                  contexts[transfers_index].easy_handle);
+            transfers_running++;
+            // We need to kick start the new handle
+            curl_multi_perform(multi_handle, &still_running);
+          }
+          transfers_index++;
+        }
       }
     }
-  } while (still_running);
+  } while (still_running ||
+           transfers_index <
+               num_urls); // Continue if running OR if items left in queue
 
   // --- Final Rendering Pass ---
   // Iterate through all contexts and print their final status on their lines
@@ -595,6 +650,8 @@ int main(int argc, char *argv[]) {
   // --- Cleanup ---
   for (int i = 0; i < num_urls; i++) {
     if (contexts[i].easy_handle) {
+      // curl_multi_remove_handle might fail if it was already removed, but
+      // that's fine/safe
       curl_multi_remove_handle(multi_handle, contexts[i].easy_handle);
       curl_easy_cleanup(contexts[i].easy_handle);
     }
