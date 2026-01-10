@@ -1,10 +1,11 @@
 
-#define SDL_VERSION "0.2.4"
+#define SDL_VERSION "0.3.0"
 
 // sdl.c - Simple Downloader
 // A command-line utility to download files from a given URL with a progress
 // bar.
 
+#include <ctype.h>
 #include <curl/curl.h> // Required for libcurl - a library for transferring data with URLs
 #include <errno.h> // Required for errno and EEXIST
 #include <stdio.h>
@@ -236,15 +237,18 @@ int main(int argc, char *argv[]) {
   // Variable to store the URL provided by the user
   char *url = NULL;
   // Array to store multiple URLs for multi-download mode
-  char *urls[100]; // Max 100 URLs for now
+  char *urls[1000]; // Max 1000 URLs
   int num_urls = 0;
   int multi_mode = 0; // Flag for multi-download mode
 
   // Check if enough arguments are provided
   if (argc < 2) {
-    fprintf(stderr, "Usage: %s [options] [--url <URL> | --multi <URL1> ...]\n",
+    fprintf(stderr,
+            "Usage: %s [options] [--url <URL> | --multi <URL1> ... | --file "
+            "<file>]\n",
             argv[0]);
     fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -f, --file <file>          Read URLs from a file\n");
     fprintf(stderr, "  -d, --destination <dir>    Set destination directory\n");
     fprintf(stderr,
             "  -aw, --always-overwrite    Always overwrite existing files\n");
@@ -280,7 +284,7 @@ int main(int argc, char *argv[]) {
       multi_mode = 1;
       // Collect all subsequent arguments as URLs
       while (++i < argc && argv[i][0] != '-') {
-        if (num_urls < 100) {
+        if (num_urls < 1000) {
           urls[num_urls++] = argv[i];
         }
       }
@@ -288,6 +292,42 @@ int main(int argc, char *argv[]) {
 
       if (num_urls == 0) {
         fprintf(stderr, "Error: No URLs provided after %s\n", argv[i - 1]);
+        return EXIT_FAILURE;
+      }
+    } else if (strcmp(argv[i], "--file") == 0 || strcmp(argv[i], "-f") == 0) {
+      if (++i < argc) {
+        FILE *file = fopen(argv[i], "r");
+        if (!file) {
+          fprintf(stderr, "Error: Could not open file '%s'\n", argv[i]);
+          return EXIT_FAILURE;
+        }
+
+        char line[2048];
+        while (fgets(line, sizeof(line), file)) {
+          // Trim whitespace
+          char *p = line;
+          while (isspace((unsigned char)*p))
+            p++; // Trim leading
+          if (*p == 0)
+            continue; // Empty line
+
+          char *end = p + strlen(p) - 1;
+          while (end > p && isspace((unsigned char)*end))
+            end--; // Trim trailing
+          *(end + 1) = 0;
+
+          if (num_urls < 1000) {
+            urls[num_urls++] = strdup(p);
+          } else {
+            fprintf(stderr, "Warning: Maximum number of URLs (1000) reached. "
+                            "Ignoring remaining.\n");
+            break;
+          }
+        }
+        fclose(file);
+        multi_mode = 1; // Treat file input as multi-mode
+      } else {
+        fprintf(stderr, "Error: No file provided after %s\n", argv[i - 1]);
         return EXIT_FAILURE;
       }
     }
