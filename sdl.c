@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.5.0"
+#define SDL_VERSION "0.51.0"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -230,6 +230,8 @@ static int g_always_overwrite = 0;
 static char *g_destination_dir = NULL;
 // Global variable for maximum parallel downloads (default 1000 for "parallel")
 static int g_max_parallel = 1000;
+// Global flag to disable progress bar rendering, showing only percentage and speed
+static int g_no_progress_bar = 0;
 
 // Structure to hold progress bar data, including data for speed calculation
 struct progress_data {
@@ -393,21 +395,25 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
         snprintf(speed_str, sizeof(speed_str), "%.1f MB/s",
                  speed_bps / (1024 * 1024));
 
-      // Draw the progress bar
+      // Draw the progress bar or just percentage/speed
       double percentage = ((double)dlnow / dltotal) * 100.0;
-      int num_blocks = (int)(percentage / 100.0 * bar_width);
 
-      char colored_bracket[32]; // Buffer for colored bracket
-      snprintf(colored_bracket, sizeof(colored_bracket), "[%s",
-               ANSI_COLOR_GREEN);
-      printf("%-20.20s %s", display_filename, colored_bracket);
+      if (g_no_progress_bar) {
+          printf("%-20.20s %6.2f%% %-12s                        ", display_filename, percentage, speed_str); // Added spaces to clear
+      } else {
+          int num_blocks = (int)(percentage / 100.0 * bar_width);
+          char colored_bracket[32]; // Buffer for colored bracket
+          snprintf(colored_bracket, sizeof(colored_bracket), "[%s",
+                   ANSI_COLOR_GREEN);
+          printf("%-20.20s %s", display_filename, colored_bracket);
 
-      for (int i = 0; i < num_blocks; i++)
-        printf("\u2588");
-      printf(ANSI_COLOR_RESET);
-      for (int i = num_blocks; i < bar_width; i++)
-        printf("\u2591");
-      printf("] %6.2f%% %-12s", percentage, speed_str);
+          for (int i = 0; i < num_blocks; i++)
+            printf("\u2588");
+          printf(ANSI_COLOR_RESET);
+          for (int i = num_blocks; i < bar_width; i++)
+            printf("\u2591");
+          printf("] %6.2f%% %-12s", percentage, speed_str);
+      }
     }
     break;
   }
@@ -415,12 +421,17 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
     // Draw a "Failed" message
     char colored_bracket[32]; // Buffer for colored bracket
     snprintf(colored_bracket, sizeof(colored_bracket), "[%s", ANSI_COLOR_RED);
-    printf("%-20.20s %s", display_filename, colored_bracket);
+    
+    if (g_no_progress_bar) {
+        printf("%-20.20s [Failed (Code: %ld)]                           ", display_filename, context->response_code);
+    } else {
+        printf("%-20.20s %s", display_filename, colored_bracket);
 
-    for (int i = 0; i < bar_width; i++)
-      printf("!");
-    printf(ANSI_COLOR_RESET "] Failed (Code: %ld)       ",
-           context->response_code);
+        for (int i = 0; i < bar_width; i++)
+          printf("!");
+        printf(ANSI_COLOR_RESET "] Failed (Code: %ld)       ",
+               context->response_code);
+    }
     break;
   }
   default:
@@ -556,6 +567,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: No file provided after %s\n", argv[i - 1]);
         return EXIT_FAILURE;
       }
+    } else if (strcmp(argv[i], "--nobar") == 0) {
+      g_no_progress_bar = 1;
     }
   }
 
@@ -842,28 +855,40 @@ int main(int argc, char *argv[]) {
 
     switch (contexts[i].status) {
     case STATUS_SUCCESS:
-      printf("%-20.20s ", display_filename); // Print filename and space
-      printf("[%s", ANSI_COLOR_GREEN);       // Print colored opening bracket
-      for (int k = 0; k < bar_width; k++)
-        printf("\u2588");
-      printf(ANSI_COLOR_RESET
-             "] [Completed]               "); // Clear the rest of the line
+      if (g_no_progress_bar) {
+          printf("%-20.20s [Completed]                                   ", display_filename);
+      } else {
+          printf("%-20.20s ", display_filename); // Print filename and space
+          printf("[%s", ANSI_COLOR_GREEN);       // Print colored opening bracket
+          for (int k = 0; k < bar_width; k++)
+            printf("\u2588");
+          printf(ANSI_COLOR_RESET
+                 "] [Completed]               "); // Clear the rest of the line
+      }
       break;
     case STATUS_FAILED:
-      printf("%-20.20s ", display_filename); // Print filename and space
-      printf("[%s", ANSI_COLOR_RED);         // Print colored opening bracket
-      for (int k = 0; k < bar_width; k++)
-        printf("!");
-      printf(ANSI_COLOR_RESET "] [Failed (Code: %ld)]",
-             contexts[i].response_code);
+      if (g_no_progress_bar) {
+          printf("%-20.20s [Failed (Code: %ld)]                           ", display_filename, contexts[i].response_code);
+      } else {
+          printf("%-20.20s ", display_filename); // Print filename and space
+          printf("[%s", ANSI_COLOR_RED);         // Print colored opening bracket
+          for (int k = 0; k < bar_width; k++)
+            printf("!");
+          printf(ANSI_COLOR_RESET "] [Failed (Code: %ld)]",
+                 contexts[i].response_code);
+      }
       break;
     case STATUS_PENDING:     // Should not happen for active transfers, but for
                              // robustness
     case STATUS_DOWNLOADING: // Should now be finished, if not SUCCESS or FAILED
     default:
-      printf("%-20.20s [----------------------------------------] "
-             "[Skipped/Error]       ",
-             display_filename);
+      if (g_no_progress_bar) {
+          printf("%-20.20s [Skipped/Error]                               ", display_filename);
+      } else {
+          printf("%-20.20s [----------------------------------------] "
+                 "[Skipped/Error]       ",
+                 display_filename);
+      }
       break;
     }
     // Move cursor back down
