@@ -1,1 +1,11 @@
 .aider*
+GoFileDownloader/
+
+# Archive files
+*.zip
+*.bz2
+*.tar
+*.rar
+
+# Compiled binary
+sdl

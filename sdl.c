@@ -1,7 +1,7 @@
 
-#define SDL_VERSION "0.4.0"
+#define SDL_VERSION "0.5.0"
 
-// sdl.c - Simple Downloader
+// sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
 // bar.
 
@@ -14,6 +14,207 @@
 #include <sys/stat.h> // Required for stat() and mkdir()
 #include <sys/time.h> // Required for gettimeofday to calculate download speed
 #include <unistd.h>   // Required for access() to check file existence
+#include <signal.h>   // Required for signal handling (e.g., Ctrl+C)
+
+// --- Cursor and Signal Handling ---
+void show_cursor() {
+  printf("\x1b[?25h");
+  fflush(stdout);
+}
+
+void handle_sigint(int sig) {
+  printf("\n\n"); // Move to a new line clear from progress bars
+  show_cursor();
+  printf("Download interrupted by user. Exiting.\n");
+  exit(130); // Standard exit code for processes terminated by Ctrl+C
+}
+
+// --- Gofile.io API specific logic ---
+
+// Global variable to store the Gofile guest token
+static char *g_gofile_token = NULL;
+
+// Structure to hold data fetched from curl in memory
+struct MemoryStruct {
+  char *memory;
+  size_t size;
+};
+
+// Callback function for curl to write data into a MemoryStruct
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb,
+                                  void *userp) {
+  size_t realsize = size * nmemb;
+  struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+
+  char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+  if (ptr == NULL) {
+    fprintf(stderr, "Error: not enough memory (realloc returned NULL)\n");
+    return 0;
+  }
+
+  mem->memory = ptr;
+  memcpy(&(mem->memory[mem->size]), contents, realsize);
+  mem->size += realsize;
+  mem->memory[mem->size] = 0;
+
+  return realsize;
+}
+
+// Fetches a guest token from Gofile and stores it in the global variable
+void ensure_gofile_token() {
+  if (g_gofile_token != NULL) {
+    return; // Token already exists
+  }
+
+  printf("Fetching Gofile guest token...\n");
+  CURL *curl_handle;
+  CURLcode res;
+  struct MemoryStruct chunk;
+  chunk.memory = malloc(1);
+  chunk.size = 0;
+
+  curl_handle = curl_easy_init();
+  if (curl_handle) {
+    // Mimic headers from the python script
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0");
+    headers = curl_slist_append(headers, "Accept: */*");
+    headers = curl_slist_append(headers, "Accept-Encoding: gzip");
+    headers = curl_slist_append(headers, "Connection: keep-alive");
+    
+    curl_easy_setopt(curl_handle, CURLOPT_URL, "https://api.gofile.io/accounts");
+    curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, ""); // No data needed
+    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+
+    res = curl_easy_perform(curl_handle);
+    
+    if (res == CURLE_OK) {
+      long response_code;
+      curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
+      if (response_code >= 200 && response_code < 300) {
+        const char *status_key = "\"status\": \"ok\"";
+        if (strstr(chunk.memory, status_key)) {
+            const char *token_key = "\"token\": \"";
+            char *ptr = strstr(chunk.memory, token_key);
+            if (ptr) {
+                ptr += strlen(token_key);
+                char *end_ptr = strchr(ptr, '"');
+                if (end_ptr) {
+                    size_t token_len = end_ptr - ptr;
+                    g_gofile_token = malloc(token_len + 1);
+                    memcpy(g_gofile_token, ptr, token_len);
+                    g_gofile_token[token_len] = '\0';
+                    printf("Gofile token obtained successfully.\n");
+                }
+            }
+        } else {
+            fprintf(stderr, "Failed to get Gofile token: API status not 'ok'.\n");
+        }
+      }
+    } else {
+      fprintf(stderr, "Failed to get Gofile token: %s\n", curl_easy_strerror(res));
+    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl_handle);
+  }
+  free(chunk.memory);
+}
+
+
+// Function to check if a URL is a Gofile URL
+int is_gofile_url(const char *url) {
+  return (strstr(url, "gofile.io/d/") != NULL);
+}
+
+// Resolves Gofile URLs, adding direct links to the list, and passing non-gofile URLs through.
+void resolve_urls(char **original_urls, int original_num_urls, char **final_urls, int *final_num_urls, const int max_urls) {
+    CURL *curl_handle;
+    CURLcode res;
+
+    for (int i = 0; i < original_num_urls; i++) {
+        if (is_gofile_url(original_urls[i])) {
+            printf("Resolving Gofile URL: %s\n", original_urls[i]);
+            
+            ensure_gofile_token();
+            if (!g_gofile_token) {
+                fprintf(stderr, "Skipping Gofile URL, token not available: %s\n", original_urls[i]);
+                continue;
+            }
+
+            const char *content_id_ptr = strrchr(original_urls[i], '/');
+            if (!content_id_ptr) continue;
+            const char *content_id = content_id_ptr + 1;
+
+            char api_url[512];
+            snprintf(api_url, sizeof(api_url), "https://api.gofile.io/contents/%s?cache=true&sortField=createTime&sortDirection=1", content_id);
+
+            struct MemoryStruct chunk;
+            chunk.memory = malloc(1);
+            chunk.size = 0;
+
+            curl_handle = curl_easy_init();
+            if (curl_handle) {
+                char auth_header[512];
+                snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", g_gofile_token);
+                struct curl_slist *headers = NULL;
+                headers = curl_slist_append(headers, auth_header);
+
+                curl_easy_setopt(curl_handle, CURLOPT_URL, api_url);
+                curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+                curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+
+                res = curl_easy_perform(curl_handle);
+
+                if (res == CURLE_OK) {
+                    long response_code;
+                    curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
+
+                    if (response_code >= 200 && response_code < 300) {
+                        const char *ptr = chunk.memory;
+                        const char *link_key = "\"link\": \"";
+                        while ((ptr = strstr(ptr, link_key)) != NULL) {
+                            ptr += strlen(link_key);
+                            const char *end_ptr = strchr(ptr, '"');
+                            if (end_ptr) {
+                                if (*final_num_urls < max_urls) {
+                                    size_t link_len = end_ptr - ptr;
+                                    char *direct_link = malloc(link_len + 1);
+                                    memcpy(direct_link, ptr, link_len);
+                                    direct_link[link_len] = '\0';
+                                    final_urls[*final_num_urls] = direct_link;
+                                    (*final_num_urls)++;
+                                    printf("  -> Found direct link: %s\n", direct_link);
+                                } else {
+                                    fprintf(stderr, "Warning: Max URLs reached, ignoring further Gofile links.\n");
+                                    break;
+                                }
+                                ptr = end_ptr;
+                            }
+                        }
+                    } else {
+                        fprintf(stderr, "Gofile API returned HTTP %ld for %s\n", response_code, api_url);
+                    }
+                } else {
+                    fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+                }
+
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl_handle);
+            }
+            free(chunk.memory);
+        } else {
+            if (*final_num_urls < max_urls) {
+                final_urls[*final_num_urls] = original_urls[i];
+                (*final_num_urls)++;
+            }
+        }
+    }
+}
+
 
 // --- Color definitions for progress bar ---
 #define ANSI_COLOR_GREEN "\x1b[32m"
@@ -236,15 +437,19 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
 
 // main function - entry point of the program
 int main(int argc, char *argv[]) {
+  // Register signal handler for Ctrl+C
+  signal(SIGINT, handle_sigint);
+
   // Variable to store the URL provided by the user
   char *url = NULL;
   // Array to store multiple URLs for multi-download mode
-  char *urls[1000]; // Max 1000 URLs
-  int num_urls = 0;
+  char *initial_urls[1000]; // Max 1000 URLs
+  int num_initial_urls = 0;
   int multi_mode = 0; // Flag for multi-download mode
 
   // Check if enough arguments are provided
   if (argc < 2) {
+    fprintf(stderr,"Subliminal DownLoader\n");
     fprintf(stderr,
             "Usage: %s [options] [--url <URL> | --multi <URL1> ... | --file "
             "<file>]\n",
@@ -263,7 +468,7 @@ int main(int argc, char *argv[]) {
   // Loop through command-line arguments
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
-      printf("sdl version %s\n", SDL_VERSION);
+      printf("Subliminal DownLoader version %s\n", SDL_VERSION);
       return EXIT_SUCCESS;
     } else if (strcmp(argv[i], "--always-overwrite") == 0 ||
                strcmp(argv[i], "-aw") == 0) {
@@ -296,7 +501,7 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "--url") == 0 || strcmp(argv[i], "-u") == 0) {
       if (++i < argc) {
         url = argv[i];
-        num_urls = 1;
+        num_initial_urls = 1;
       } else {
         fprintf(stderr, "Error: No URL provided after %s\n", argv[i]);
         return EXIT_FAILURE;
@@ -305,13 +510,13 @@ int main(int argc, char *argv[]) {
       multi_mode = 1;
       // Collect all subsequent arguments as URLs
       while (++i < argc && argv[i][0] != '-') {
-        if (num_urls < 1000) {
-          urls[num_urls++] = argv[i];
+        if (num_initial_urls < 1000) {
+          initial_urls[num_initial_urls++] = argv[i];
         }
       }
       i--; // Decrement because the loop will increment it
 
-      if (num_urls == 0) {
+      if (num_initial_urls == 0) {
         fprintf(stderr, "Error: No URLs provided after %s\n", argv[i - 1]);
         return EXIT_FAILURE;
       }
@@ -337,8 +542,8 @@ int main(int argc, char *argv[]) {
             end--; // Trim trailing
           *(end + 1) = 0;
 
-          if (num_urls < 1000) {
-            urls[num_urls++] = strdup(p);
+          if (num_initial_urls < 1000) {
+            initial_urls[num_initial_urls++] = strdup(p);
           } else {
             fprintf(stderr, "Warning: Maximum number of URLs (1000) reached. "
                             "Ignoring remaining.\n");
@@ -355,14 +560,30 @@ int main(int argc, char *argv[]) {
   }
 
   // Check if any URL was provided
-  if (num_urls == 0 && url == NULL) {
+  if (num_initial_urls == 0 && url == NULL) {
     fprintf(stderr, "Error: No URL(s) provided. Use --url or --multi.\n");
     return EXIT_FAILURE;
   }
 
   // If not in multi_mode, but a single url was provided
   if (!multi_mode && url != NULL) {
-    urls[0] = url;
+    initial_urls[0] = url;
+  }
+
+  // --- URL Resolution Step ---
+  char *urls[1000];
+  int num_urls = 0;
+  resolve_urls(initial_urls, num_initial_urls, urls, &num_urls, 1000);
+  
+  // Free the token now that resolution is done
+  if (g_gofile_token) {
+      free(g_gofile_token);
+      g_gofile_token = NULL;
+  }
+
+  if (num_urls == 0) {
+    printf("No downloadable files found after resolving URLs.\n");
+    return EXIT_SUCCESS;
   }
 
   // --- Handle destination directory ---
@@ -518,6 +739,9 @@ int main(int argc, char *argv[]) {
     printf("\n");
   }
 
+  // Hide cursor for clean progress bar rendering
+  printf("\x1b[?25l");
+
   // --- Perform the transfers ---
   int transfers_running = 0;
   int transfers_index = 0;
@@ -648,6 +872,7 @@ int main(int argc, char *argv[]) {
   printf("\n"); // Final newline to push the prompt below the output
 
   // --- Cleanup ---
+  show_cursor();
   for (int i = 0; i < num_urls; i++) {
     if (contexts[i].easy_handle) {
       // curl_multi_remove_handle might fail if it was already removed, but
