@@ -232,6 +232,7 @@ void resolve_urls(char **original_urls, int original_num_urls,
 // --- Color definitions for progress bar ---
 #define ANSI_COLOR_GREEN "\x1b[32m"
 #define ANSI_COLOR_RED "\x1b[31m" // Define ANSI color for red
+#define ANSI_COLOR_CYAN "\x1b[36m"
 #define ANSI_COLOR_RESET "\x1b[0m"
 
 // Global variable to hold the total number of downloads for progress bar
@@ -436,8 +437,11 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
       } else {
         int num_blocks = (int)(percentage / 100.0 * bar_width);
         char colored_bracket[32]; // Buffer for colored bracket
-        snprintf(colored_bracket, sizeof(colored_bracket), "[%s",
-                 ANSI_COLOR_GREEN);
+        const char *color = ANSI_COLOR_GREEN;
+        if (context->resume_offset > 0) {
+          color = ANSI_COLOR_CYAN;
+        }
+        snprintf(colored_bracket, sizeof(colored_bracket), "[%s", color);
         printf("%-20.20s %s", display_filename, colored_bracket);
 
         for (int i = 0; i < num_blocks; i++)
@@ -445,7 +449,11 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
         printf(ANSI_COLOR_RESET);
         for (int i = num_blocks; i < bar_width; i++)
           printf("\u2591");
+
         printf("] %6.2f%% %-12s", percentage, speed_str);
+        if (context->resume_offset > 0) {
+          printf(" (Resumed)");
+        }
       }
     }
     break;
