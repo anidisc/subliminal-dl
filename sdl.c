@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.51.0"
+#define SDL_VERSION "0.52.0"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -7,14 +7,14 @@
 
 #include <ctype.h>
 #include <curl/curl.h> // Required for libcurl - a library for transferring data with URLs
-#include <errno.h> // Required for errno and EEXIST
+#include <errno.h>  // Required for errno and EEXIST
+#include <signal.h> // Required for signal handling (e.g., Ctrl+C)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h> // Required for stat() and mkdir()
 #include <sys/time.h> // Required for gettimeofday to calculate download speed
 #include <unistd.h>   // Required for access() to check file existence
-#include <signal.h>   // Required for signal handling (e.g., Ctrl+C)
 
 // --- Cursor and Signal Handling ---
 void show_cursor() {
@@ -81,8 +81,9 @@ void ensure_gofile_token() {
     headers = curl_slist_append(headers, "Accept: */*");
     headers = curl_slist_append(headers, "Accept-Encoding: gzip");
     headers = curl_slist_append(headers, "Connection: keep-alive");
-    
-    curl_easy_setopt(curl_handle, CURLOPT_URL, "https://api.gofile.io/accounts");
+
+    curl_easy_setopt(curl_handle, CURLOPT_URL,
+                     "https://api.gofile.io/accounts");
     curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, ""); // No data needed
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
@@ -90,32 +91,33 @@ void ensure_gofile_token() {
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
 
     res = curl_easy_perform(curl_handle);
-    
+
     if (res == CURLE_OK) {
       long response_code;
       curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
       if (response_code >= 200 && response_code < 300) {
         const char *status_key = "\"status\": \"ok\"";
         if (strstr(chunk.memory, status_key)) {
-            const char *token_key = "\"token\": \"";
-            char *ptr = strstr(chunk.memory, token_key);
-            if (ptr) {
-                ptr += strlen(token_key);
-                char *end_ptr = strchr(ptr, '"');
-                if (end_ptr) {
-                    size_t token_len = end_ptr - ptr;
-                    g_gofile_token = malloc(token_len + 1);
-                    memcpy(g_gofile_token, ptr, token_len);
-                    g_gofile_token[token_len] = '\0';
-                    printf("Gofile token obtained successfully.\n");
-                }
+          const char *token_key = "\"token\": \"";
+          char *ptr = strstr(chunk.memory, token_key);
+          if (ptr) {
+            ptr += strlen(token_key);
+            char *end_ptr = strchr(ptr, '"');
+            if (end_ptr) {
+              size_t token_len = end_ptr - ptr;
+              g_gofile_token = malloc(token_len + 1);
+              memcpy(g_gofile_token, ptr, token_len);
+              g_gofile_token[token_len] = '\0';
+              printf("Gofile token obtained successfully.\n");
             }
+          }
         } else {
-            fprintf(stderr, "Failed to get Gofile token: API status not 'ok'.\n");
+          fprintf(stderr, "Failed to get Gofile token: API status not 'ok'.\n");
         }
       }
     } else {
-      fprintf(stderr, "Failed to get Gofile token: %s\n", curl_easy_strerror(res));
+      fprintf(stderr, "Failed to get Gofile token: %s\n",
+              curl_easy_strerror(res));
     }
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl_handle);
@@ -123,98 +125,109 @@ void ensure_gofile_token() {
   free(chunk.memory);
 }
 
-
 // Function to check if a URL is a Gofile URL
 int is_gofile_url(const char *url) {
   return (strstr(url, "gofile.io/d/") != NULL);
 }
 
-// Resolves Gofile URLs, adding direct links to the list, and passing non-gofile URLs through.
-void resolve_urls(char **original_urls, int original_num_urls, char **final_urls, int *final_num_urls, const int max_urls) {
-    CURL *curl_handle;
-    CURLcode res;
+// Resolves Gofile URLs, adding direct links to the list, and passing non-gofile
+// URLs through.
+void resolve_urls(char **original_urls, int original_num_urls,
+                  char **final_urls, int *final_num_urls, const int max_urls) {
+  CURL *curl_handle;
+  CURLcode res;
 
-    for (int i = 0; i < original_num_urls; i++) {
-        if (is_gofile_url(original_urls[i])) {
-            printf("Resolving Gofile URL: %s\n", original_urls[i]);
-            
-            ensure_gofile_token();
-            if (!g_gofile_token) {
-                fprintf(stderr, "Skipping Gofile URL, token not available: %s\n", original_urls[i]);
-                continue;
-            }
+  for (int i = 0; i < original_num_urls; i++) {
+    if (is_gofile_url(original_urls[i])) {
+      printf("Resolving Gofile URL: %s\n", original_urls[i]);
 
-            const char *content_id_ptr = strrchr(original_urls[i], '/');
-            if (!content_id_ptr) continue;
-            const char *content_id = content_id_ptr + 1;
+      ensure_gofile_token();
+      if (!g_gofile_token) {
+        fprintf(stderr, "Skipping Gofile URL, token not available: %s\n",
+                original_urls[i]);
+        continue;
+      }
 
-            char api_url[512];
-            snprintf(api_url, sizeof(api_url), "https://api.gofile.io/contents/%s?cache=true&sortField=createTime&sortDirection=1", content_id);
+      const char *content_id_ptr = strrchr(original_urls[i], '/');
+      if (!content_id_ptr)
+        continue;
+      const char *content_id = content_id_ptr + 1;
 
-            struct MemoryStruct chunk;
-            chunk.memory = malloc(1);
-            chunk.size = 0;
+      char api_url[512];
+      snprintf(api_url, sizeof(api_url),
+               "https://api.gofile.io/contents/"
+               "%s?cache=true&sortField=createTime&sortDirection=1",
+               content_id);
 
-            curl_handle = curl_easy_init();
-            if (curl_handle) {
-                char auth_header[512];
-                snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", g_gofile_token);
-                struct curl_slist *headers = NULL;
-                headers = curl_slist_append(headers, auth_header);
+      struct MemoryStruct chunk;
+      chunk.memory = malloc(1);
+      chunk.size = 0;
 
-                curl_easy_setopt(curl_handle, CURLOPT_URL, api_url);
-                curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-                curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-                curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+      curl_handle = curl_easy_init();
+      if (curl_handle) {
+        char auth_header[512];
+        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s",
+                 g_gofile_token);
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, auth_header);
 
-                res = curl_easy_perform(curl_handle);
+        curl_easy_setopt(curl_handle, CURLOPT_URL, api_url);
+        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION,
+                         WriteMemoryCallback);
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
 
-                if (res == CURLE_OK) {
-                    long response_code;
-                    curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
+        res = curl_easy_perform(curl_handle);
 
-                    if (response_code >= 200 && response_code < 300) {
-                        const char *ptr = chunk.memory;
-                        const char *link_key = "\"link\": \"";
-                        while ((ptr = strstr(ptr, link_key)) != NULL) {
-                            ptr += strlen(link_key);
-                            const char *end_ptr = strchr(ptr, '"');
-                            if (end_ptr) {
-                                if (*final_num_urls < max_urls) {
-                                    size_t link_len = end_ptr - ptr;
-                                    char *direct_link = malloc(link_len + 1);
-                                    memcpy(direct_link, ptr, link_len);
-                                    direct_link[link_len] = '\0';
-                                    final_urls[*final_num_urls] = direct_link;
-                                    (*final_num_urls)++;
-                                    printf("  -> Found direct link: %s\n", direct_link);
-                                } else {
-                                    fprintf(stderr, "Warning: Max URLs reached, ignoring further Gofile links.\n");
-                                    break;
-                                }
-                                ptr = end_ptr;
-                            }
-                        }
-                    } else {
-                        fprintf(stderr, "Gofile API returned HTTP %ld for %s\n", response_code, api_url);
-                    }
+        if (res == CURLE_OK) {
+          long response_code;
+          curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE,
+                            &response_code);
+
+          if (response_code >= 200 && response_code < 300) {
+            const char *ptr = chunk.memory;
+            const char *link_key = "\"link\": \"";
+            while ((ptr = strstr(ptr, link_key)) != NULL) {
+              ptr += strlen(link_key);
+              const char *end_ptr = strchr(ptr, '"');
+              if (end_ptr) {
+                if (*final_num_urls < max_urls) {
+                  size_t link_len = end_ptr - ptr;
+                  char *direct_link = malloc(link_len + 1);
+                  memcpy(direct_link, ptr, link_len);
+                  direct_link[link_len] = '\0';
+                  final_urls[*final_num_urls] = direct_link;
+                  (*final_num_urls)++;
+                  printf("  -> Found direct link: %s\n", direct_link);
                 } else {
-                    fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+                  fprintf(stderr, "Warning: Max URLs reached, ignoring further "
+                                  "Gofile links.\n");
+                  break;
                 }
-
-                curl_slist_free_all(headers);
-                curl_easy_cleanup(curl_handle);
+                ptr = end_ptr;
+              }
             }
-            free(chunk.memory);
+          } else {
+            fprintf(stderr, "Gofile API returned HTTP %ld for %s\n",
+                    response_code, api_url);
+          }
         } else {
-            if (*final_num_urls < max_urls) {
-                final_urls[*final_num_urls] = original_urls[i];
-                (*final_num_urls)++;
-            }
+          fprintf(stderr, "curl_easy_perform() failed: %s\n",
+                  curl_easy_strerror(res));
         }
-    }
-}
 
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl_handle);
+      }
+      free(chunk.memory);
+    } else {
+      if (*final_num_urls < max_urls) {
+        final_urls[*final_num_urls] = original_urls[i];
+        (*final_num_urls)++;
+      }
+    }
+  }
+}
 
 // --- Color definitions for progress bar ---
 #define ANSI_COLOR_GREEN "\x1b[32m"
@@ -230,7 +243,8 @@ static int g_always_overwrite = 0;
 static char *g_destination_dir = NULL;
 // Global variable for maximum parallel downloads (default 1000 for "parallel")
 static int g_max_parallel = 1000;
-// Global flag to disable progress bar rendering, showing only percentage and speed
+// Global flag to disable progress bar rendering, showing only percentage and
+// speed
 static int g_no_progress_bar = 0;
 
 // Structure to hold progress bar data, including data for speed calculation
@@ -249,14 +263,17 @@ enum transfer_status {
 
 // Structure to hold all context for a single transfer
 struct transfer_context {
-  CURL *easy_handle; // The easy handle for this specific transfer
-  FILE *fp;          // The file pointer for the output file
-  char *filename;    // The name of the output file
+  CURL *easy_handle;        // The easy handle for this specific transfer
+  FILE *fp;                 // The file pointer for the output file
+  char *filename;           // The name of the final output file
+  char *part_filename;      // The name of the partial file
+  curl_off_t resume_offset; // Offset to resume from
   struct progress_data
       progress;    // The progress data for this transfer's progress bar
   int line_number; // The terminal line number for this transfer's progress bar
   enum transfer_status status; // The current status of the download
   long response_code;          // To store the final HTTP response code
+  int restart_needed; // Flag to indicate if download needs to be restarted
 };
 
 // Function to handle libcurl write operations (saving data to a file)
@@ -336,7 +353,16 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
     curl_easy_getinfo(context->easy_handle, CURLINFO_RESPONSE_CODE,
                       &context->response_code);
     if (context->response_code > 0) { // Headers received
-      if (context->response_code >= 200 && context->response_code < 300) {
+      if (context->response_code == 206) {
+        // Resume successful
+        context->status = STATUS_DOWNLOADING;
+      } else if (context->response_code >= 200 &&
+                 context->response_code < 300) {
+        if (context->resume_offset > 0) {
+          // Server ignored range header, must restart
+          context->restart_needed = 1;
+          return 1; // Abort transfer
+        }
         context->status = STATUS_DOWNLOADING;
       } else if (context->response_code >= 300 &&
                  context->response_code < 400) {
@@ -396,23 +422,30 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
                  speed_bps / (1024 * 1024));
 
       // Draw the progress bar or just percentage/speed
-      double percentage = ((double)dlnow / dltotal) * 100.0;
+      double percentage = 0.0;
+      if (dltotal > 0) {
+        percentage = ((double)(context->resume_offset + dlnow) /
+                      (context->resume_offset + dltotal)) *
+                     100.0;
+      }
 
       if (g_no_progress_bar) {
-          printf("%-20.20s %6.2f%% %-12s                        ", display_filename, percentage, speed_str); // Added spaces to clear
+        printf("%-20.20s %6.2f%% %-12s                        ",
+               display_filename, percentage,
+               speed_str); // Added spaces to clear
       } else {
-          int num_blocks = (int)(percentage / 100.0 * bar_width);
-          char colored_bracket[32]; // Buffer for colored bracket
-          snprintf(colored_bracket, sizeof(colored_bracket), "[%s",
-                   ANSI_COLOR_GREEN);
-          printf("%-20.20s %s", display_filename, colored_bracket);
+        int num_blocks = (int)(percentage / 100.0 * bar_width);
+        char colored_bracket[32]; // Buffer for colored bracket
+        snprintf(colored_bracket, sizeof(colored_bracket), "[%s",
+                 ANSI_COLOR_GREEN);
+        printf("%-20.20s %s", display_filename, colored_bracket);
 
-          for (int i = 0; i < num_blocks; i++)
-            printf("\u2588");
-          printf(ANSI_COLOR_RESET);
-          for (int i = num_blocks; i < bar_width; i++)
-            printf("\u2591");
-          printf("] %6.2f%% %-12s", percentage, speed_str);
+        for (int i = 0; i < num_blocks; i++)
+          printf("\u2588");
+        printf(ANSI_COLOR_RESET);
+        for (int i = num_blocks; i < bar_width; i++)
+          printf("\u2591");
+        printf("] %6.2f%% %-12s", percentage, speed_str);
       }
     }
     break;
@@ -421,16 +454,17 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
     // Draw a "Failed" message
     char colored_bracket[32]; // Buffer for colored bracket
     snprintf(colored_bracket, sizeof(colored_bracket), "[%s", ANSI_COLOR_RED);
-    
-    if (g_no_progress_bar) {
-        printf("%-20.20s [Failed (Code: %ld)]                           ", display_filename, context->response_code);
-    } else {
-        printf("%-20.20s %s", display_filename, colored_bracket);
 
-        for (int i = 0; i < bar_width; i++)
-          printf("!");
-        printf(ANSI_COLOR_RESET "] Failed (Code: %ld)       ",
-               context->response_code);
+    if (g_no_progress_bar) {
+      printf("%-20.20s [Failed (Code: %ld)]                           ",
+             display_filename, context->response_code);
+    } else {
+      printf("%-20.20s %s", display_filename, colored_bracket);
+
+      for (int i = 0; i < bar_width; i++)
+        printf("!");
+      printf(ANSI_COLOR_RESET "] Failed (Code: %ld)       ",
+             context->response_code);
     }
     break;
   }
@@ -460,7 +494,7 @@ int main(int argc, char *argv[]) {
 
   // Check if enough arguments are provided
   if (argc < 2) {
-    fprintf(stderr,"Subliminal DownLoader\n");
+    fprintf(stderr, "Subliminal DownLoader\n");
     fprintf(stderr,
             "Usage: %s [options] [--url <URL> | --multi <URL1> ... | --file "
             "<file>]\n",
@@ -587,11 +621,11 @@ int main(int argc, char *argv[]) {
   char *urls[1000];
   int num_urls = 0;
   resolve_urls(initial_urls, num_initial_urls, urls, &num_urls, 1000);
-  
+
   // Free the token now that resolution is done
   if (g_gofile_token) {
-      free(g_gofile_token);
-      g_gofile_token = NULL;
+    free(g_gofile_token);
+    g_gofile_token = NULL;
   }
 
   if (num_urls == 0) {
@@ -674,6 +708,12 @@ int main(int argc, char *argv[]) {
       contexts[i].filename = strdup(base_filename_ptr);
     }
 
+    // Generate .part filename
+    size_t part_len = strlen(contexts[i].filename) + 6; // + ".part" + '\0'
+    contexts[i].part_filename = malloc(part_len);
+    snprintf(contexts[i].part_filename, part_len, "%s.part",
+             contexts[i].filename);
+
     // --- File conflict check ---
     if (!g_always_overwrite && access(contexts[i].filename, F_OK) == 0) {
       printf("File '%s' already exists. [O]verwrite, [C]opy, [S]kip? ",
@@ -688,6 +728,12 @@ int main(int argc, char *argv[]) {
         char *new_name = generate_copy_filename(contexts[i].filename);
         free(contexts[i].filename); // Free the old name
         contexts[i].filename = new_name;
+        // Update part_filename
+        free(contexts[i].part_filename);
+        size_t part_len = strlen(contexts[i].filename) + 6;
+        contexts[i].part_filename = malloc(part_len);
+        snprintf(contexts[i].part_filename, part_len, "%s.part",
+                 contexts[i].filename);
         printf("Will save as '%s'\n", contexts[i].filename);
         break;
       }
@@ -696,6 +742,8 @@ int main(int argc, char *argv[]) {
         printf("Skipping download for '%s'\n", urls[i]);
         free(contexts[i].filename);
         contexts[i].filename = NULL;
+        free(contexts[i].part_filename);
+        contexts[i].part_filename = NULL;
         curl_easy_cleanup(contexts[i].easy_handle);
         contexts[i].easy_handle = NULL; // Mark as skipped
         continue;                       // Go to next URL in the loop
@@ -707,13 +755,23 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // Open file for writing
-    contexts[i].fp = fopen(contexts[i].filename, "wb");
+    // Check for existing partial file to resume
+    struct stat st;
+    if (stat(contexts[i].part_filename, &st) == 0) {
+      contexts[i].resume_offset = st.st_size;
+      contexts[i].fp = fopen(contexts[i].part_filename, "ab");
+    } else {
+      contexts[i].resume_offset = 0;
+      contexts[i].fp = fopen(contexts[i].part_filename, "wb");
+    }
+
     if (!contexts[i].fp) {
       fprintf(stderr, "Error: Could not open file %s for writing.\n",
-              contexts[i].filename);
+              contexts[i].part_filename);
       free(contexts[i].filename);
       contexts[i].filename = NULL;
+      free(contexts[i].part_filename);
+      contexts[i].part_filename = NULL;
       curl_easy_cleanup(contexts[i].easy_handle);
       contexts[i].easy_handle = NULL; // Mark as failed/skipped
       continue;
@@ -726,6 +784,10 @@ int main(int argc, char *argv[]) {
     curl_easy_setopt(contexts[i].easy_handle, CURLOPT_WRITEDATA,
                      contexts[i].fp);
     curl_easy_setopt(contexts[i].easy_handle, CURLOPT_FOLLOWLOCATION, 1L);
+    if (contexts[i].resume_offset > 0) {
+      curl_easy_setopt(contexts[i].easy_handle, CURLOPT_RESUME_FROM_LARGE,
+                       contexts[i].resume_offset);
+    }
     curl_easy_setopt(contexts[i].easy_handle, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(contexts[i].easy_handle, CURLOPT_XFERINFOFUNCTION,
                      progress_callback);
@@ -803,15 +865,64 @@ int main(int argc, char *argv[]) {
                               &response_code);
             contexts[i].response_code = response_code;
 
-            if (result == CURLE_OK &&
-                (response_code >= 200 && response_code < 300)) {
-              contexts[i].status = STATUS_SUCCESS;
-            } else {
-              contexts[i].status = STATUS_FAILED;
+            if (contexts[i].restart_needed) {
+              // Handle restart
+              curl_multi_remove_handle(multi_handle, easy_handle);
+              transfers_running--;
+
+              // Reset context
+              contexts[i].restart_needed = 0;
+              contexts[i].resume_offset = 0;
+              contexts[i].status = STATUS_PENDING;
+
+              // Truncate file
               if (contexts[i].fp) {
                 fclose(contexts[i].fp);
-                contexts[i].fp = NULL; // Avoid double close
-                remove(contexts[i].filename);
+                contexts[i].fp = fopen(contexts[i].part_filename, "wb");
+              }
+
+              // Update curl options
+              curl_easy_setopt(contexts[i].easy_handle,
+                               CURLOPT_RESUME_FROM_LARGE, (curl_off_t)0);
+              curl_easy_setopt(contexts[i].easy_handle, CURLOPT_WRITEDATA,
+                               contexts[i].fp);
+
+              // Add back to queue (by resetting index or re-adding
+              // immediately?) We can just re-add it immediately if we want to
+              // keep slot
+              curl_multi_add_handle(multi_handle, contexts[i].easy_handle);
+              transfers_running++;
+              curl_multi_perform(multi_handle, &still_running);
+              break; // Continue outer loop
+            }
+
+            if (result == CURLE_OK &&
+                ((response_code >= 200 && response_code < 300) ||
+                 response_code == 206)) {
+              contexts[i].status = STATUS_SUCCESS;
+              if (contexts[i].fp) {
+                fclose(contexts[i].fp);
+                contexts[i].fp = NULL;
+              }
+              if (rename(contexts[i].part_filename, contexts[i].filename) !=
+                  0) {
+                fprintf(stderr, "Error renaming %s to %s\n",
+                        contexts[i].part_filename, contexts[i].filename);
+                contexts[i].status = STATUS_FAILED;
+              }
+            } else {
+              contexts[i].status = STATUS_FAILED;
+              // If failed, we keep the part file to allow resume later, UNLESS
+              // it's a client/server error that suggests the file is invalid or
+              // gone (4xx, 5xx). Exception: 416 Range Not Satisfiable (maybe
+              // file changed/finished?) For now, remove if >= 400.
+              if (response_code >= 400) {
+                remove(contexts[i].part_filename);
+              }
+
+              if (contexts[i].fp) {
+                fclose(contexts[i].fp);
+                contexts[i].fp = NULL;
               }
             }
             break;
@@ -856,26 +967,28 @@ int main(int argc, char *argv[]) {
     switch (contexts[i].status) {
     case STATUS_SUCCESS:
       if (g_no_progress_bar) {
-          printf("%-20.20s [Completed]                                   ", display_filename);
+        printf("%-20.20s [Completed]                                   ",
+               display_filename);
       } else {
-          printf("%-20.20s ", display_filename); // Print filename and space
-          printf("[%s", ANSI_COLOR_GREEN);       // Print colored opening bracket
-          for (int k = 0; k < bar_width; k++)
-            printf("\u2588");
-          printf(ANSI_COLOR_RESET
-                 "] [Completed]               "); // Clear the rest of the line
+        printf("%-20.20s ", display_filename); // Print filename and space
+        printf("[%s", ANSI_COLOR_GREEN);       // Print colored opening bracket
+        for (int k = 0; k < bar_width; k++)
+          printf("\u2588");
+        printf(ANSI_COLOR_RESET
+               "] [Completed]               "); // Clear the rest of the line
       }
       break;
     case STATUS_FAILED:
       if (g_no_progress_bar) {
-          printf("%-20.20s [Failed (Code: %ld)]                           ", display_filename, contexts[i].response_code);
+        printf("%-20.20s [Failed (Code: %ld)]                           ",
+               display_filename, contexts[i].response_code);
       } else {
-          printf("%-20.20s ", display_filename); // Print filename and space
-          printf("[%s", ANSI_COLOR_RED);         // Print colored opening bracket
-          for (int k = 0; k < bar_width; k++)
-            printf("!");
-          printf(ANSI_COLOR_RESET "] [Failed (Code: %ld)]",
-                 contexts[i].response_code);
+        printf("%-20.20s ", display_filename); // Print filename and space
+        printf("[%s", ANSI_COLOR_RED);         // Print colored opening bracket
+        for (int k = 0; k < bar_width; k++)
+          printf("!");
+        printf(ANSI_COLOR_RESET "] [Failed (Code: %ld)]",
+               contexts[i].response_code);
       }
       break;
     case STATUS_PENDING:     // Should not happen for active transfers, but for
@@ -883,11 +996,12 @@ int main(int argc, char *argv[]) {
     case STATUS_DOWNLOADING: // Should now be finished, if not SUCCESS or FAILED
     default:
       if (g_no_progress_bar) {
-          printf("%-20.20s [Skipped/Error]                               ", display_filename);
+        printf("%-20.20s [Skipped/Error]                               ",
+               display_filename);
       } else {
-          printf("%-20.20s [----------------------------------------] "
-                 "[Skipped/Error]       ",
-                 display_filename);
+        printf("%-20.20s [----------------------------------------] "
+               "[Skipped/Error]       ",
+               display_filename);
       }
       break;
     }
@@ -909,6 +1023,8 @@ int main(int argc, char *argv[]) {
       fclose(contexts[i].fp);
     if (contexts[i].filename)
       free(contexts[i].filename); // Always free filename
+    if (contexts[i].part_filename)
+      free(contexts[i].part_filename);
   }
   curl_multi_cleanup(multi_handle);
   curl_global_cleanup();
