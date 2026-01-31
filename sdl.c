@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.53.5"
+#define SDL_VERSION "0.53.8"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -507,8 +507,16 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
       }
 
       if (g_no_progress_bar) {
-        printf("%-20.20s %6.2f%% %-12s                        ",
-               display_filename, percentage,
+        // Braille spinner frames
+        const char *spinner_frames[] = {"⠋", "⠙", "⠹", "⠸", "⠼",
+                                        "⠴", "⠦", "⠧", "⠇", "⠏"};
+        int num_frames = 10;
+        // Calculate frame based on time to animate
+        int frame_idx =
+            (current_time_us / 100000) % num_frames; // Change frame every 100ms
+
+        printf("%s %-20.20s %6.2f%% %-12s                     ",
+               spinner_frames[frame_idx], display_filename, percentage,
                speed_str); // Added spaces to clear
       } else {
         int num_blocks = (int)(percentage / 100.0 * bar_width);
@@ -578,7 +586,7 @@ int main(int argc, char *argv[]) {
 
   // Check if enough arguments are provided
   if (argc < 2) {
-    fprintf(stderr, "Subliminal DownLoader\n");
+    fprintf(stderr, "Subliminal DownLoader version %s\n", SDL_VERSION);
     fprintf(stderr,
             "Usage: %s [options] [--url <URL> | --multi <URL1> ... | --file "
             "<file> | --add <URL> | --queue]\n",
