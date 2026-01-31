@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.53.1"
+#define SDL_VERSION "0.53.5"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
