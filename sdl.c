@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.53.8"
+#define SDL_VERSION "0.54.0"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -582,7 +582,8 @@ int main(int argc, char *argv[]) {
   // Array to store multiple URLs for multi-download mode
   char *initial_urls[1000]; // Max 1000 URLs
   int num_initial_urls = 0;
-  int multi_mode = 0; // Flag for multi-download mode
+  int multi_mode = 0;                    // Flag for multi-download mode
+  curl_off_t g_download_limit_bytes = 0; // Download limit per connection
 
   // Check if enough arguments are provided
   if (argc < 2) {
@@ -596,6 +597,8 @@ int main(int argc, char *argv[]) {
                     "(sequential) or 'parallel' (simultaneous)\n");
     fprintf(stderr, "  -f, --file <file>          Read URLs from a file\n");
     fprintf(stderr, "  -d, --destination <dir>    Set destination directory\n");
+    fprintf(stderr, "  -l, --limit-download <MB>  Limit download speed per "
+                    "connection (e.g. 1.5)\n");
     fprintf(stderr,
             "  -aw, --always-overwrite    Always overwrite existing files\n");
     fprintf(stderr,
@@ -742,6 +745,19 @@ int main(int argc, char *argv[]) {
       multi_mode = 1; // Treat as multi-mode
     } else if (strcmp(argv[i], "--nobar") == 0) {
       g_no_progress_bar = 1;
+    } else if (strcmp(argv[i], "--limit-download") == 0 ||
+               strcmp(argv[i], "-l") == 0) {
+      if (++i < argc) {
+        double limit_mb = atof(argv[i]);
+        if (limit_mb <= 0) {
+          fprintf(stderr, "Error: Invalid limit value. Must be > 0 MB/s\n");
+          return EXIT_FAILURE;
+        }
+        g_download_limit_bytes = (curl_off_t)(limit_mb * 1024 * 1024);
+      } else {
+        fprintf(stderr, "Error: No limit provided after %s\n", argv[i - 1]);
+        return EXIT_FAILURE;
+      }
     }
   }
 
@@ -934,6 +950,12 @@ int main(int argc, char *argv[]) {
     // Pass the context for this transfer to the progress callback
     curl_easy_setopt(contexts[i].easy_handle, CURLOPT_XFERINFODATA,
                      &contexts[i]);
+
+    // Apply download speed limit if set
+    if (g_download_limit_bytes > 0) {
+      curl_easy_setopt(contexts[i].easy_handle, CURLOPT_MAX_RECV_SPEED_LARGE,
+                       g_download_limit_bytes);
+    }
 
     // Don't add to multi_handle here yet. We do it in the loop based on
     // g_max_parallel
