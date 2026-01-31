@@ -594,6 +594,8 @@ int main(int argc, char *argv[]) {
             "  -a, --add <URL>            Add URL to queue (dburl.txt)\n");
     fprintf(stderr, "  -Q, --queue                Process queue (dburl.txt) "
                     "and remove on success\n");
+    fprintf(stderr,
+            "  --nobar                    Disable progress bar rendering\n");
     fprintf(stderr, "  -v, --version              Show version\n");
     return EXIT_FAILURE; // Exit with an error code
   }
