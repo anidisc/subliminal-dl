@@ -1043,37 +1043,42 @@ int main(int argc, char *argv[]) {
               } else {
                 // Success!
                 if (g_queue_mode) {
-                  // We need to use the original URL, which we can find by
-                  // iterating (or we could have stored it in context) For now,
-                  // let's just use urls[i] which was passed linearly and we
-                  // haven't reordered. Wait, resolve_urls might have changed
-                  // things if it was a gofile link. But the DB contains the
-                  // *original* link usually? Actually, if resolve_urls changed
-                  // it, we might be removing the wrong string if we remove the
-                  // resolved one. But resolve_urls does: final_urls[...]. The
-                  // current loop is on `num_urls`, which is the resolved list
-                  // size. This complexity suggests we should store the
-                  // *original* URL in context if we want to support removing
-                  // gofile links properly. HOWEVER, for this MVP, assuming
-                  // direct links in DB or that we remove what we downloaded. IF
-                  // we added a gofile link to DB, resolve_urls converts it. We
-                  // download the converted. We need to remove the *original*
-                  // stored in DB. Let's assume for now 1:1 mapping (sdl.c
-                  // structure makes mapping back hard without extra storage).
-                  // The easiest fix: If g_queue_mode, `urls` array indices
-                  // match `initial_urls` ONLY if no expansion happens? Actually
-                  // resolve_urls creates a NEW array. Let's just try to remove
-                  // `urls[i]`. If it was a resolved link, it won't be in the DB
-                  // (the DB has the parent), so it won't be removed. This is a
-                  // limitation. To fix, we need to pass the "source URL" to the
-                  // context.
-
-                  // Let's add `source_url` to transfer_context.
                   remove_url_from_db(urls[i]);
                 }
               }
             } else {
               contexts[i].status = STATUS_FAILED;
+
+              int should_remove_from_queue = 0;
+
+              // Check for fatal errors to remove from queue
+              if (result != CURLE_OK) {
+                // If it's NOT a connection/temporary error, assume it's fatal
+                // (e.g. malformed URL)
+                if (result != CURLE_COULDNT_CONNECT &&
+                    result != CURLE_COULDNT_RESOLVE_HOST &&
+                    result != CURLE_OPERATION_TIMEDOUT &&
+                    result != CURLE_GOT_NOTHING && result != CURLE_RECV_ERROR) {
+                  should_remove_from_queue = 1;
+                }
+              } else {
+                // It was an HTTP error code
+                if (response_code >= 400 && response_code < 500) {
+                  // Client error (404 Not Found, 410 Gone, 403 Forbidden, etc.)
+                  // -> Remove
+                  should_remove_from_queue = 1;
+                }
+                // 5xx errors are Server Errors, might be temporary, so we KEEP
+                // them.
+              }
+
+              if (g_queue_mode && should_remove_from_queue) {
+                printf("\nRemoving invalid/failed URL from queue: %s (Code: "
+                       "%ld, Result: %d)\n",
+                       urls[i], response_code, result);
+                remove_url_from_db(urls[i]);
+              }
+
               // If failed, we keep the part file to allow resume later, UNLESS
               // it's a client/server error that suggests the file is invalid or
               // gone (4xx, 5xx). Exception: 416 Range Not Satisfiable (maybe
