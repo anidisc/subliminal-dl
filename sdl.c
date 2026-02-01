@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.54.0"
+#define SDL_VERSION "0.55.0"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -324,6 +324,67 @@ void remove_url_from_db(const char *url_to_remove) {
   }
 }
 
+// Function to list the content of the queue with progress estimation
+void list_queue_content() {
+  FILE *fp = fopen(DB_FILENAME, "r");
+  if (!fp) {
+    printf("Queue is empty or dburl.txt not found.\n");
+    return;
+  }
+
+  printf("\n--- Download Queue ---\n");
+  printf("%-5s | %-40s | %-20s\n", "Idx", "URL", "Status/Progress");
+  printf("------+------------------------------------------+-------------------"
+         "---\n");
+
+  char line[2048];
+  int index = 1;
+  while (fgets(line, sizeof(line), fp)) {
+    // Trim newline
+    line[strcspn(line, "\n")] = 0;
+    if (strlen(line) == 0)
+      continue;
+
+    // Truncate URL for display
+    char display_url[41];
+    if (strlen(line) > 40) {
+      strncpy(display_url, line, 37);
+      strcpy(display_url + 37, "...");
+    } else {
+      strcpy(display_url, line);
+    }
+
+    // Guess filename
+    char *base_filename = strrchr(line, '/');
+    if (base_filename) {
+      base_filename++; // Skip slash
+    } else {
+      base_filename = "unknown";
+    }
+
+    // Check file status
+    char status_str[32] = "Pending";
+    struct stat st;
+    char part_filename[1024];
+
+    // Check for completed file (in current dir)
+    if (stat(base_filename, &st) == 0) {
+      snprintf(status_str, sizeof(status_str), "Completed");
+    } else {
+      snprintf(part_filename, sizeof(part_filename), "%s.part", base_filename);
+      if (stat(part_filename, &st) == 0) {
+        double size_mb = (double)st.st_size / (1024 * 1024);
+        snprintf(status_str, sizeof(status_str), "Partial (%.2f MB)", size_mb);
+      }
+    }
+
+    printf("%-5d | %-40s | %-20s\n", index++, display_url, status_str);
+  }
+  printf("---------------------------------------------------------------------"
+         "-\n");
+  fclose(fp);
+}
+
 // Structure to hold progress bar data, including data for speed calculation
 struct progress_data {
   curl_off_t last_dl_now; // Last reported downloaded bytes
@@ -606,6 +667,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "  -Q, --queue                Process queue (dburl.txt) "
                     "and remove on success\n");
     fprintf(stderr,
+            "  -L, --list                 List queue content with progress\n");
+    fprintf(stderr,
             "  --nobar                    Disable progress bar rendering\n");
     fprintf(stderr, "  -v, --version              Show version\n");
     return EXIT_FAILURE; // Exit with an error code
@@ -758,6 +821,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: No limit provided after %s\n", argv[i - 1]);
         return EXIT_FAILURE;
       }
+    } else if (strcmp(argv[i], "--list") == 0 || strcmp(argv[i], "-L") == 0) {
+      list_queue_content();
+      return EXIT_SUCCESS;
     }
   }
 
