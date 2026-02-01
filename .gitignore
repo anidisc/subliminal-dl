@@ -9,3 +9,8 @@ GoFileDownloader/
 
 # Compiled binary
 sdl
+*.bin
+
+# Database files and test files
+dburl.txt
+test*

@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.55.0"
+#define SDL_VERSION "0.56.0"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -133,7 +133,8 @@ int is_gofile_url(const char *url) {
 // Resolves Gofile URLs, adding direct links to the list, and passing non-gofile
 // URLs through.
 void resolve_urls(char **original_urls, int original_num_urls,
-                  char **final_urls, int *final_num_urls, const int max_urls) {
+                  char **final_urls, char **final_source_urls,
+                  int *final_num_urls, int max_urls) {
   CURL *curl_handle;
   CURLcode res;
 
@@ -197,6 +198,7 @@ void resolve_urls(char **original_urls, int original_num_urls,
                   memcpy(direct_link, ptr, link_len);
                   direct_link[link_len] = '\0';
                   final_urls[*final_num_urls] = direct_link;
+                  final_source_urls[*final_num_urls] = original_urls[i];
                   (*final_num_urls)++;
                   printf("  -> Found direct link: %s\n", direct_link);
                 } else {
@@ -223,6 +225,7 @@ void resolve_urls(char **original_urls, int original_num_urls,
     } else {
       if (*final_num_urls < max_urls) {
         final_urls[*final_num_urls] = original_urls[i];
+        final_source_urls[*final_num_urls] = original_urls[i];
         (*final_num_urls)++;
       }
     }
@@ -385,6 +388,41 @@ void list_queue_content() {
   fclose(fp);
 }
 
+// Helper to check if a specific ID is in the selected list
+int is_id_selected(int id, int *selected_ids, int num_selected) {
+  if (num_selected == 0)
+    return 1; // If none specified, all are selected
+  for (int i = 0; i < num_selected; i++) {
+    if (selected_ids[i] == id)
+      return 1;
+  }
+  return 0;
+}
+
+// Helper to parse range strings like "1,3-5,7"
+int parse_id_ranges(const char *range_str, int *selected_ids, int max_ids) {
+  int num_selected = 0;
+  char *copy = strdup(range_str);
+  char *token = strtok(copy, ",");
+
+  while (token && num_selected < max_ids) {
+    if (strchr(token, '-')) {
+      int start, end;
+      if (sscanf(token, "%d-%d", &start, &end) == 2) {
+        for (int i = start; i <= end && num_selected < max_ids; i++) {
+          selected_ids[num_selected++] = i;
+        }
+      }
+    } else {
+      selected_ids[num_selected++] = atoi(token);
+    }
+    token = strtok(NULL, ",");
+  }
+
+  free(copy);
+  return num_selected;
+}
+
 // Structure to hold progress bar data, including data for speed calculation
 struct progress_data {
   curl_off_t last_dl_now; // Last reported downloaded bytes
@@ -412,6 +450,7 @@ struct transfer_context {
   enum transfer_status status; // The current status of the download
   long response_code;          // To store the final HTTP response code
   int restart_needed; // Flag to indicate if download needs to be restarted
+  char *source_url;   // Original URL (for queue mode)
 };
 
 // Function to handle libcurl write operations (saving data to a file)
@@ -651,7 +690,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Subliminal DownLoader version %s\n", SDL_VERSION);
     fprintf(stderr,
             "Usage: %s [options] [--url <URL> | --multi <URL1> ... | --file "
-            "<file> | --add <URL> | --queue]\n",
+            "<file> | --add <URL> | --queue [ids]]\n",
             argv[0]);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -j, --jobs <mode>          Set download mode: 'code' "
@@ -664,8 +703,8 @@ int main(int argc, char *argv[]) {
             "  -aw, --always-overwrite    Always overwrite existing files\n");
     fprintf(stderr,
             "  -a, --add <URL>            Add URL to queue (dburl.txt)\n");
-    fprintf(stderr, "  -Q, --queue                Process queue (dburl.txt) "
-                    "and remove on success\n");
+    fprintf(stderr, "  -Q, --queue [ids]          Process queue (dburl.txt). "
+                    "Optional ids: 1,3-5\n");
     fprintf(stderr,
             "  -L, --list                 List queue content with progress\n");
     fprintf(stderr,
@@ -775,6 +814,14 @@ int main(int argc, char *argv[]) {
       }
     } else if (strcmp(argv[i], "--queue") == 0 || strcmp(argv[i], "-Q") == 0) {
       g_queue_mode = 1;
+      int selected_ids[1000];
+      int num_selected = 0;
+
+      // Check if the next argument is a range/ID string
+      if (i + 1 < argc && (isdigit(argv[i + 1][0]) || argv[i + 1][0] == '\"')) {
+        num_selected = parse_id_ranges(argv[++i], selected_ids, 1000);
+      }
+
       // Load URLs from DB_FILENAME
       FILE *file = fopen(DB_FILENAME, "r");
       if (!file) {
@@ -783,6 +830,7 @@ int main(int argc, char *argv[]) {
       }
 
       char line[2048];
+      int current_line_id = 1;
       while (fgets(line, sizeof(line), file)) {
         // Trim whitespace
         char *p = line;
@@ -796,12 +844,14 @@ int main(int argc, char *argv[]) {
           end--; // Trim trailing
         *(end + 1) = 0;
 
-        if (num_initial_urls < 1000) {
-          initial_urls[num_initial_urls++] = strdup(p);
-        } else {
-          fprintf(stderr, "Warning: Maximum number of URLs (1000) reached. "
-                          "Ignoring remaining.\n");
-          break;
+        if (is_id_selected(current_line_id++, selected_ids, num_selected)) {
+          if (num_initial_urls < 1000) {
+            initial_urls[num_initial_urls++] = strdup(p);
+          } else {
+            fprintf(stderr, "Warning: Maximum number of URLs (1000) reached. "
+                            "Ignoring remaining.\n");
+            break;
+          }
         }
       }
       fclose(file);
@@ -840,8 +890,10 @@ int main(int argc, char *argv[]) {
 
   // --- URL Resolution Step ---
   char *urls[1000];
+  char *source_urls[1000];
   int num_urls = 0;
-  resolve_urls(initial_urls, num_initial_urls, urls, &num_urls, 1000);
+  resolve_urls(initial_urls, num_initial_urls, urls, source_urls, &num_urls,
+               1000);
 
   // Free the token now that resolution is done
   if (g_gofile_token) {
@@ -886,8 +938,7 @@ int main(int argc, char *argv[]) {
 
   // --- Multi-download logic setup ---
   CURLM *multi_handle = NULL;
-  struct transfer_context
-      contexts[100]; // Array to hold contexts for each download
+  struct transfer_context contexts[1000]; // Increased buffer to match max_urls
 
   // Initialize libcurl global state
   curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -898,11 +949,14 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
+  g_total_downloads = num_urls; // Update global for progress bar
+
   // Prepare each transfer
   for (int i = 0; i < num_urls; i++) {
     // Initialize context fields to NULL/0
     memset(&contexts[i], 0, sizeof(struct transfer_context));
     contexts[i].status = STATUS_PENDING;
+    contexts[i].source_url = source_urls[i];
 
     contexts[i].easy_handle = curl_easy_init();
     if (!contexts[i].easy_handle) {
@@ -1034,7 +1088,7 @@ int main(int argc, char *argv[]) {
       contexts[i].line_number = active_downloads++;
     }
   }
-  g_total_downloads = active_downloads;
+  // g_total_downloads is already set to num_urls
 
   // Print empty lines to make space for progress bars
   for (int i = 0; i < g_total_downloads; i++) {
@@ -1138,42 +1192,9 @@ int main(int argc, char *argv[]) {
                 contexts[i].status = STATUS_FAILED;
               } else {
                 // Success!
-                if (g_queue_mode) {
-                  remove_url_from_db(urls[i]);
-                }
               }
             } else {
               contexts[i].status = STATUS_FAILED;
-
-              int should_remove_from_queue = 0;
-
-              // Check for fatal errors to remove from queue
-              if (result != CURLE_OK) {
-                // If it's NOT a connection/temporary error, assume it's fatal
-                // (e.g. malformed URL)
-                if (result != CURLE_COULDNT_CONNECT &&
-                    result != CURLE_COULDNT_RESOLVE_HOST &&
-                    result != CURLE_OPERATION_TIMEDOUT &&
-                    result != CURLE_GOT_NOTHING && result != CURLE_RECV_ERROR) {
-                  should_remove_from_queue = 1;
-                }
-              } else {
-                // It was an HTTP error code
-                if (response_code >= 400 && response_code < 500) {
-                  // Client error (404 Not Found, 410 Gone, 403 Forbidden, etc.)
-                  // -> Remove
-                  should_remove_from_queue = 1;
-                }
-                // 5xx errors are Server Errors, might be temporary, so we KEEP
-                // them.
-              }
-
-              if (g_queue_mode && should_remove_from_queue) {
-                printf("\nRemoving invalid/failed URL from queue: %s (Code: "
-                       "%ld, Result: %d)\n",
-                       urls[i], response_code, result);
-                remove_url_from_db(urls[i]);
-              }
 
               // If failed, we keep the part file to allow resume later, UNLESS
               // it's a client/server error that suggests the file is invalid or
@@ -1268,36 +1289,44 @@ int main(int argc, char *argv[]) {
       }
       break;
     }
-    // Move cursor back down
+    // Move cursor back down (to avoid messing up next line rendering)
     printf("\x1b[%dB", g_total_downloads - contexts[i].line_number);
   }
-  printf("\n"); // Final newline to push the prompt below the output
+  printf("\n"); // Move to end of progress area
 
-  // --- Cleanup ---
+  // --- Deferred Queue Removal ---
+  if (g_queue_mode) {
+    for (int i = 0; i < num_urls; i++) {
+      if (contexts[i].status == STATUS_SUCCESS) {
+        remove_url_from_db(contexts[i].source_url);
+      } else {
+        // Also check for fatal errors that warrant removal
+        long response_code = contexts[i].response_code;
+        if (response_code >= 400 && response_code < 500) {
+          remove_url_from_db(contexts[i].source_url);
+        }
+      }
+    }
+  }
+
+  // Cleanup
   show_cursor();
   for (int i = 0; i < num_urls; i++) {
     if (contexts[i].easy_handle) {
-      // curl_multi_remove_handle might fail if it was already removed, but
-      // that's fine/safe
       curl_multi_remove_handle(multi_handle, contexts[i].easy_handle);
       curl_easy_cleanup(contexts[i].easy_handle);
     }
     if (contexts[i].fp)
       fclose(contexts[i].fp);
     if (contexts[i].filename)
-      free(contexts[i].filename); // Always free filename
+      free(contexts[i].filename);
     if (contexts[i].part_filename)
       free(contexts[i].part_filename);
   }
   curl_multi_cleanup(multi_handle);
   curl_global_cleanup();
 
-  // Print final newlines to clear the progress bars and push the prompt down
-  for (int i = 0; i < g_total_downloads; i++) {
-    printf("\n");
-  }
-
-  return EXIT_SUCCESS; // Exit successfully
+  return EXIT_SUCCESS;
 }
 
 /*
