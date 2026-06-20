@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.56.0"
+#define SDL_VERSION "0.56.1"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -15,6 +15,8 @@
 #include <sys/stat.h> // Required for stat() and mkdir()
 #include <sys/time.h> // Required for gettimeofday to calculate download speed
 #include <unistd.h>   // Required for access() to check file existence
+#include <openssl/evp.h> // Required for SHA-256
+#include <time.h>        // Required for time()
 
 // --- Cursor and Signal Handling ---
 void show_cursor() {
@@ -33,6 +35,66 @@ void handle_sigint(int sig) {
 
 // Global variable to store the Gofile guest token
 static char *g_gofile_token = NULL;
+
+#define GOFILE_USER_AGENT "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+#define GOFILE_TOKEN_FILE "gofile_token.txt"
+
+// --- SHA-256 Hashing using OpenSSL EVP ---
+void sha256_string(const char *string, char outputBuffer[65]) {
+  unsigned char hash[32];
+  unsigned int hash_len;
+  EVP_MD_CTX *context = EVP_MD_CTX_new();
+  EVP_DigestInit_ex(context, EVP_sha256(), NULL);
+  EVP_DigestUpdate(context, string, strlen(string));
+  EVP_DigestFinal_ex(context, hash, &hash_len);
+  EVP_MD_CTX_free(context);
+
+  for (int i = 0; i < 32; i++) {
+    sprintf(outputBuffer + (i * 2), "%02x", hash[i]);
+  }
+  outputBuffer[64] = '\0';
+}
+
+// --- Gofile Website Token (WT) Generator ---
+void generate_gofile_wt(const char *token, char wt_out[65]) {
+  char raw_str[1024];
+  long long timeslot = time(NULL) / 14400;
+  // Salt from gallery-dl: "5d4f7g8sd45fsd"
+  const char *salt = "5d4f7g8sd45fsd";
+  snprintf(raw_str, sizeof(raw_str), "%s::en-US::%s::%lld::%s", GOFILE_USER_AGENT, token, timeslot, salt);
+  sha256_string(raw_str, wt_out);
+}
+
+// --- Gofile Guest Token Caching ---
+void load_gofile_token() {
+  FILE *f = fopen(GOFILE_TOKEN_FILE, "r");
+  if (f) {
+    char buf[256];
+    if (fgets(buf, sizeof(buf), f)) {
+      buf[strcspn(buf, "\r\n")] = '\0';
+      if (strlen(buf) > 0) {
+        g_gofile_token = strdup(buf);
+      }
+    }
+    fclose(f);
+  }
+}
+
+void save_gofile_token(const char *token) {
+  FILE *f = fopen(GOFILE_TOKEN_FILE, "w");
+  if (f) {
+    fprintf(f, "%s\n", token);
+    fclose(f);
+  }
+}
+
+void invalidate_gofile_token() {
+  if (g_gofile_token) {
+    free(g_gofile_token);
+    g_gofile_token = NULL;
+  }
+  unlink(GOFILE_TOKEN_FILE);
+}
 
 // Structure to hold data fetched from curl in memory
 struct MemoryStruct {
@@ -66,6 +128,11 @@ void ensure_gofile_token() {
     return; // Token already exists
   }
 
+  load_gofile_token();
+  if (g_gofile_token != NULL) {
+    return; // Token loaded from cache
+  }
+
   printf("Fetching Gofile guest token...\n");
   CURL *curl_handle;
   CURLcode res;
@@ -75,9 +142,12 @@ void ensure_gofile_token() {
 
   curl_handle = curl_easy_init();
   if (curl_handle) {
+    char ua_header[512];
+    snprintf(ua_header, sizeof(ua_header), "User-Agent: %s", GOFILE_USER_AGENT);
+
     // Mimic headers from the python script
     struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0");
+    headers = curl_slist_append(headers, ua_header);
     headers = curl_slist_append(headers, "Accept: */*");
     headers = curl_slist_append(headers, "Accept-Encoding: gzip");
     headers = curl_slist_append(headers, "Connection: keep-alive");
@@ -108,6 +178,7 @@ void ensure_gofile_token() {
               g_gofile_token = malloc(token_len + 1);
               memcpy(g_gofile_token, ptr, token_len);
               g_gofile_token[token_len] = '\0';
+              save_gofile_token(g_gofile_token);
               printf("Gofile token obtained successfully.\n");
             }
           }
@@ -142,86 +213,111 @@ void resolve_urls(char **original_urls, int original_num_urls,
     if (is_gofile_url(original_urls[i])) {
       printf("Resolving Gofile URL: %s\n", original_urls[i]);
 
-      ensure_gofile_token();
-      if (!g_gofile_token) {
-        fprintf(stderr, "Skipping Gofile URL, token not available: %s\n",
-                original_urls[i]);
-        continue;
-      }
+      int retries = 2;
+      int success = 0;
 
-      const char *content_id_ptr = strrchr(original_urls[i], '/');
-      if (!content_id_ptr)
-        continue;
-      const char *content_id = content_id_ptr + 1;
-
-      char api_url[512];
-      snprintf(api_url, sizeof(api_url),
-               "https://api.gofile.io/contents/"
-               "%s?cache=true&sortField=createTime&sortDirection=1",
-               content_id);
-
-      struct MemoryStruct chunk;
-      chunk.memory = malloc(1);
-      chunk.size = 0;
-
-      curl_handle = curl_easy_init();
-      if (curl_handle) {
-        char auth_header[512];
-        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s",
-                 g_gofile_token);
-        struct curl_slist *headers = NULL;
-        headers = curl_slist_append(headers, auth_header);
-
-        curl_easy_setopt(curl_handle, CURLOPT_URL, api_url);
-        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION,
-                         WriteMemoryCallback);
-        curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-
-        res = curl_easy_perform(curl_handle);
-
-        if (res == CURLE_OK) {
-          long response_code;
-          curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE,
-                            &response_code);
-
-          if (response_code >= 200 && response_code < 300) {
-            const char *ptr = chunk.memory;
-            const char *link_key = "\"link\": \"";
-            while ((ptr = strstr(ptr, link_key)) != NULL) {
-              ptr += strlen(link_key);
-              const char *end_ptr = strchr(ptr, '"');
-              if (end_ptr) {
-                if (*final_num_urls < max_urls) {
-                  size_t link_len = end_ptr - ptr;
-                  char *direct_link = malloc(link_len + 1);
-                  memcpy(direct_link, ptr, link_len);
-                  direct_link[link_len] = '\0';
-                  final_urls[*final_num_urls] = direct_link;
-                  final_source_urls[*final_num_urls] = original_urls[i];
-                  (*final_num_urls)++;
-                  printf("  -> Found direct link: %s\n", direct_link);
-                } else {
-                  fprintf(stderr, "Warning: Max URLs reached, ignoring further "
-                                  "Gofile links.\n");
-                  break;
-                }
-                ptr = end_ptr;
-              }
-            }
-          } else {
-            fprintf(stderr, "Gofile API returned HTTP %ld for %s\n",
-                    response_code, api_url);
-          }
-        } else {
-          fprintf(stderr, "curl_easy_perform() failed: %s\n",
-                  curl_easy_strerror(res));
+      while (retries > 0 && !success) {
+        ensure_gofile_token();
+        if (!g_gofile_token) {
+          fprintf(stderr, "Skipping Gofile URL, token not available: %s\n",
+                  original_urls[i]);
+          break;
         }
 
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl_handle);
+        const char *content_id_ptr = strrchr(original_urls[i], '/');
+        if (!content_id_ptr)
+          break;
+        const char *content_id = content_id_ptr + 1;
+
+        char api_url[1024];
+        snprintf(api_url, sizeof(api_url),
+                 "https://api.gofile.io/contents/%s?contentFilter=&page=1&pageSize=1000&sortField=name&sortDirection=1",
+                 content_id);
+
+        struct MemoryStruct chunk;
+        chunk.memory = malloc(1);
+        chunk.size = 0;
+
+        curl_handle = curl_easy_init();
+        if (curl_handle) {
+          char auth_header[512];
+          snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s",
+                   g_gofile_token);
+
+          char ua_header[512];
+          snprintf(ua_header, sizeof(ua_header), "User-Agent: %s", GOFILE_USER_AGENT);
+
+          char wt_token[65];
+          generate_gofile_wt(g_gofile_token, wt_token);
+          char wt_header[128];
+          snprintf(wt_header, sizeof(wt_header), "X-Website-Token: %s", wt_token);
+
+          struct curl_slist *headers = NULL;
+          headers = curl_slist_append(headers, auth_header);
+          headers = curl_slist_append(headers, ua_header);
+          headers = curl_slist_append(headers, wt_header);
+          headers = curl_slist_append(headers, "X-BL: en-US");
+          headers = curl_slist_append(headers, "Referer: https://gofile.io/");
+          headers = curl_slist_append(headers, "Origin: https://gofile.io");
+
+          curl_easy_setopt(curl_handle, CURLOPT_URL, api_url);
+          curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+          curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION,
+                           WriteMemoryCallback);
+          curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+
+          res = curl_easy_perform(curl_handle);
+
+          if (res == CURLE_OK) {
+            long response_code;
+            curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE,
+                              &response_code);
+
+            if (response_code == 401 || strstr(chunk.memory, "\"status\": \"error-notPremium\"") != NULL) {
+              fprintf(stderr, "Gofile token invalid/expired (HTTP %ld). Invalidating and retrying...\n", response_code);
+              invalidate_gofile_token();
+              retries--;
+            } else if (response_code >= 200 && response_code < 300) {
+              const char *ptr = chunk.memory;
+              const char *link_key = "\"link\": \"";
+              while ((ptr = strstr(ptr, link_key)) != NULL) {
+                ptr += strlen(link_key);
+                const char *end_ptr = strchr(ptr, '"');
+                if (end_ptr) {
+                  if (*final_num_urls < max_urls) {
+                    size_t link_len = end_ptr - ptr;
+                    char *direct_link = malloc(link_len + 1);
+                    memcpy(direct_link, ptr, link_len);
+                    direct_link[link_len] = '\0';
+                    final_urls[*final_num_urls] = direct_link;
+                    final_source_urls[*final_num_urls] = original_urls[i];
+                    (*final_num_urls)++;
+                    printf("  -> Found direct link: %s\n", direct_link);
+                  } else {
+                    fprintf(stderr, "Warning: Max URLs reached, ignoring further "
+                                    "Gofile links.\n");
+                    break;
+                  }
+                  ptr = end_ptr;
+                }
+              }
+              success = 1;
+            } else {
+              fprintf(stderr, "Gofile API returned HTTP %ld for %s\n",
+                      response_code, api_url);
+              retries = 0; // Don't retry for other HTTP errors (like 404, 429)
+            }
+          } else {
+            fprintf(stderr, "curl_easy_perform() failed: %s\n",
+                    curl_easy_strerror(res));
+            retries = 0;
+          }
+
+          curl_slist_free_all(headers);
+          curl_easy_cleanup(curl_handle);
+        }
+        free(chunk.memory);
       }
-      free(chunk.memory);
     } else {
       if (*final_num_urls < max_urls) {
         final_urls[*final_num_urls] = original_urls[i];
