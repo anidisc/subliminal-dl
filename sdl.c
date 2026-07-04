@@ -1,5 +1,5 @@
 
-#define SDL_VERSION "0.56.1"
+#define SDL_VERSION "0.56.2"
 
 // sdl.c - Subiliminal Downloader
 // A command-line utility to download files from a given URL with a progress
@@ -157,6 +157,7 @@ void ensure_gofile_token() {
     curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, ""); // No data needed
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl_handle, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
 
@@ -166,12 +167,11 @@ void ensure_gofile_token() {
       long response_code;
       curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
       if (response_code >= 200 && response_code < 300) {
-        const char *status_key = "\"status\": \"ok\"";
-        if (strstr(chunk.memory, status_key)) {
-          const char *token_key = "\"token\": \"";
-          char *ptr = strstr(chunk.memory, token_key);
+        if (strstr(chunk.memory, "\"status\":\"ok\"") || strstr(chunk.memory, "\"status\": \"ok\"")) {
+          char *ptr = strstr(chunk.memory, "\"token\"");
           if (ptr) {
-            ptr += strlen(token_key);
+            ptr += 7; // length of "\"token\""
+            while (*ptr == ' ' || *ptr == ':' || *ptr == '"') ptr++;
             char *end_ptr = strchr(ptr, '"');
             if (end_ptr) {
               size_t token_len = end_ptr - ptr;
@@ -183,7 +183,7 @@ void ensure_gofile_token() {
             }
           }
         } else {
-          fprintf(stderr, "Failed to get Gofile token: API status not 'ok'.\n");
+          fprintf(stderr, "Failed to get Gofile token: API status not 'ok'. Body: %s\n", chunk.memory);
         }
       }
     } else {
@@ -201,11 +201,27 @@ int is_gofile_url(const char *url) {
   return (strstr(url, "gofile.io/d/") != NULL);
 }
 
+curl_off_t find_gofile_size_backward(const char *start, const char *link_ptr) {
+  const char *p = link_ptr;
+  const char *limit = link_ptr - 500;
+  if (limit < start) limit = start;
+
+  while (p > limit) {
+    if (strncmp(p, "\"size\":", 7) == 0) {
+      const char *num_ptr = p + 7;
+      while (*num_ptr == ' ' || *num_ptr == ':') num_ptr++;
+      return strtoll(num_ptr, NULL, 10);
+    }
+    p--;
+  }
+  return -1;
+}
+
 // Resolves Gofile URLs, adding direct links to the list, and passing non-gofile
 // URLs through.
 void resolve_urls(char **original_urls, int original_num_urls,
                   char **final_urls, char **final_source_urls,
-                  int *final_num_urls, int max_urls) {
+                  curl_off_t *final_sizes, int *final_num_urls, int max_urls) {
   CURL *curl_handle;
   CURLcode res;
 
@@ -262,6 +278,7 @@ void resolve_urls(char **original_urls, int original_num_urls,
 
           curl_easy_setopt(curl_handle, CURLOPT_URL, api_url);
           curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+          curl_easy_setopt(curl_handle, CURLOPT_ACCEPT_ENCODING, "");
           curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION,
                            WriteMemoryCallback);
           curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
@@ -273,15 +290,15 @@ void resolve_urls(char **original_urls, int original_num_urls,
             curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE,
                               &response_code);
 
-            if (response_code == 401 || strstr(chunk.memory, "\"status\": \"error-notPremium\"") != NULL) {
+            if (response_code == 401 || strstr(chunk.memory, "error-notPremium") != NULL) {
               fprintf(stderr, "Gofile token invalid/expired (HTTP %ld). Invalidating and retrying...\n", response_code);
               invalidate_gofile_token();
               retries--;
             } else if (response_code >= 200 && response_code < 300) {
               const char *ptr = chunk.memory;
-              const char *link_key = "\"link\": \"";
-              while ((ptr = strstr(ptr, link_key)) != NULL) {
-                ptr += strlen(link_key);
+              while ((ptr = strstr(ptr, "\"link\"")) != NULL) {
+                ptr += 6; // length of "\"link\""
+                while (*ptr == ' ' || *ptr == ':' || *ptr == '"') ptr++;
                 const char *end_ptr = strchr(ptr, '"');
                 if (end_ptr) {
                   if (*final_num_urls < max_urls) {
@@ -291,11 +308,11 @@ void resolve_urls(char **original_urls, int original_num_urls,
                     direct_link[link_len] = '\0';
                     final_urls[*final_num_urls] = direct_link;
                     final_source_urls[*final_num_urls] = original_urls[i];
+                    final_sizes[*final_num_urls] = find_gofile_size_backward(chunk.memory, ptr);
                     (*final_num_urls)++;
                     printf("  -> Found direct link: %s\n", direct_link);
                   } else {
-                    fprintf(stderr, "Warning: Max URLs reached, ignoring further "
-                                    "Gofile links.\n");
+                    fprintf(stderr, "Warning: Max URLs reached, ignoring further Gofile links.\n");
                     break;
                   }
                   ptr = end_ptr;
@@ -322,6 +339,7 @@ void resolve_urls(char **original_urls, int original_num_urls,
       if (*final_num_urls < max_urls) {
         final_urls[*final_num_urls] = original_urls[i];
         final_source_urls[*final_num_urls] = original_urls[i];
+        final_sizes[*final_num_urls] = -1;
         (*final_num_urls)++;
       }
     }
@@ -768,6 +786,28 @@ int progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
   return 0; // Return 0 to continue the transfer
 }
 
+// --- Get Remote File Size using libcurl (HEAD request) ---
+curl_off_t get_remote_file_size(const char *url) {
+  CURL *curl = curl_easy_init();
+  if (!curl) return -1;
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_NOBODY, 1L); // HEAD request
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L); // 5 seconds timeout
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
+  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // Handle decompression headers
+
+  CURLcode res = curl_easy_perform(curl);
+  curl_off_t file_size = -1;
+  if (res == CURLE_OK) {
+    curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &file_size);
+  }
+
+  curl_easy_cleanup(curl);
+  return file_size;
+}
+
 // main function - entry point of the program
 int main(int argc, char *argv[]) {
   // Register signal handler for Ctrl+C
@@ -984,11 +1024,18 @@ int main(int argc, char *argv[]) {
     initial_urls[0] = url;
   }
 
+  // Initialize libcurl global state early
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+
   // --- URL Resolution Step ---
   char *urls[1000];
   char *source_urls[1000];
+  curl_off_t sizes[1000];
+  for (int i = 0; i < 1000; i++) {
+    sizes[i] = -1;
+  }
   int num_urls = 0;
-  resolve_urls(initial_urls, num_initial_urls, urls, source_urls, &num_urls,
+  resolve_urls(initial_urls, num_initial_urls, urls, source_urls, sizes, &num_urls,
                1000);
 
   // Free the token now that resolution is done
@@ -1001,6 +1048,82 @@ int main(int argc, char *argv[]) {
     printf("No downloadable files found after resolving URLs.\n");
     return EXIT_SUCCESS;
   }
+
+  // --- Retrieve remote sizes for non-Gofile URLs ---
+  printf("Retrieving remote file sizes...\n");
+  for (int i = 0; i < num_urls; i++) {
+    if (sizes[i] == -1) {
+      sizes[i] = get_remote_file_size(urls[i]);
+    }
+  }
+
+  // --- Print Download Summary ---
+  printf("\n==================================================\n");
+  printf("               DOWNLOAD SUMMARY\n");
+  printf("==================================================\n");
+  printf("Destination Dir  : %s\n", g_destination_dir ? g_destination_dir : "./ (Current Directory)");
+  printf("Download Mode    : %s\n", (g_max_parallel == 1) ? "Sequential" : "Parallel");
+  if (g_max_parallel > 1 && g_max_parallel < 1000) {
+    printf("Max Parallel Jobs: %d\n", g_max_parallel);
+  }
+  if (g_download_limit_bytes > 0) {
+    double limit_mb = (double)g_download_limit_bytes / (1024 * 1024);
+    printf("Speed Limit      : %.2f MB/s per connection\n", limit_mb);
+  } else {
+    printf("Speed Limit      : No limit\n");
+  }
+  printf("Always Overwrite : %s\n", g_always_overwrite ? "Yes" : "No (Ask for conflicts)");
+  printf("Total Files      : %d\n", num_urls);
+  printf("--------------------------------------------------\n");
+
+  curl_off_t total_size = 0;
+  int unknown_sizes = 0;
+  for (int i = 0; i < num_urls; i++) {
+    const char *basename = strrchr(urls[i], '/');
+    if (basename) basename++;
+    else basename = urls[i];
+
+    printf("%d. File: %s\n", i + 1, basename);
+    if (sizes[i] >= 0) {
+      total_size += sizes[i];
+      if (sizes[i] < 1024) {
+        printf("   Size: %lld Bytes\n", (long long)sizes[i]);
+      } else if (sizes[i] < 1024 * 1024) {
+        printf("   Size: %.2f KB (%lld Bytes)\n", (double)sizes[i] / 1024, (long long)sizes[i]);
+      } else {
+        printf("   Size: %.2f MB (%lld Bytes)\n", (double)sizes[i] / (1024 * 1024), (long long)sizes[i]);
+      }
+    } else {
+      unknown_sizes++;
+      printf("   Size: Unknown\n");
+    }
+
+    if (g_destination_dir) {
+      printf("   Save Path: %s/%s\n", g_destination_dir, basename);
+    } else {
+      printf("   Save Path: %s\n", basename);
+    }
+  }
+
+  printf("--------------------------------------------------\n");
+  if (unknown_sizes > 0) {
+    if (total_size < 1024) {
+      printf("Total Size       : %lld Bytes + %d unknown\n", (long long)total_size, unknown_sizes);
+    } else if (total_size < 1024 * 1024) {
+      printf("Total Size       : %.2f KB + %d unknown\n", (double)total_size / 1024, unknown_sizes);
+    } else {
+      printf("Total Size       : %.2f MB + %d unknown\n", (double)total_size / (1024 * 1024), unknown_sizes);
+    }
+  } else {
+    if (total_size < 1024) {
+      printf("Total Size       : %lld Bytes\n", (long long)total_size);
+    } else if (total_size < 1024 * 1024) {
+      printf("Total Size       : %.2f KB\n", (double)total_size / 1024);
+    } else {
+      printf("Total Size       : %.2f MB\n", (double)total_size / (1024 * 1024));
+    }
+  }
+  printf("==================================================\n\n");
 
   // --- Handle destination directory ---
   if (g_destination_dir) {
@@ -1036,8 +1159,7 @@ int main(int argc, char *argv[]) {
   CURLM *multi_handle = NULL;
   struct transfer_context contexts[1000]; // Increased buffer to match max_urls
 
-  // Initialize libcurl global state
-  curl_global_init(CURL_GLOBAL_DEFAULT);
+  // Initialize libcurl multi handle
   multi_handle = curl_multi_init();
 
   if (!multi_handle) {
