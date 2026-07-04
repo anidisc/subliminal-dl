@@ -1,6 +1,6 @@
 # Manuale d'Uso: Subliminal Downloader (SDL)
 
-**Versione:** 0.56.0
+**Versione:** 0.56.2
 **Autore:** Antigravity (Analisi del codice)
 
 Subliminal Downloader (SDL) è una potente utility da riga di comando scritta in C per il download di file. È progettata per gestire download singoli, multipli, e supporta nativamente la risoluzione di link Gofile.io, offrendo al contempo una barra di progresso visuale e capacità di ripristino dei download interrotti.
@@ -21,24 +21,36 @@ Subliminal Downloader (SDL) è una potente utility da riga di comando scritta in
 
 ## 1. Requisiti e Compilazione
 
-Il programma dipende dalla libreria **libcurl**.
+Il programma dipende dalle librerie **libcurl** e **openssl**.
 
 ### Installazione Dipendenze
 - **Debian/Ubuntu:**
   ```bash
   sudo apt-get update
-  sudo apt-get install libcurl4-openssl-dev pkg-config
+  sudo apt-get install libcurl4-openssl-dev libssl-dev pkg-config
   ```
 - **openSUSE:**
   ```bash
-  sudo zypper install libcurl-devel
+  sudo zypper install libcurl-devel libopenssl-devel
   ```
 
 ### Compilazione
-Per compilare il programma, eseguire il seguente comando nella directory del sorgente:
-```bash
-gcc sdl.c -o sdl $(pkg-config --libs --cflags libcurl)
-```
+Per compilare il programma, è ora disponibile un `Makefile`. È possibile compilare per diverse architetture:
+
+- **Nativa (Architettura Host):**
+  ```bash
+  make
+  ```
+- **x64 (x86_64):**
+  ```bash
+  make x64
+  ```
+- **ARM (Cross-compilazione o nativo su host ARM):**
+  ```bash
+  make arm
+  ```
+
+*(In alternativa, è possibile compilare manualmente con: `gcc sdl.c -o sdl $(pkg-config --libs --cflags libcurl) -lcrypto`)*
 
 ---
 
